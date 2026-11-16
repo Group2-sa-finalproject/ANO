@@ -901,11 +901,6 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         </div>
 
-        <div class="back-wrap">
-            <a href="../admin/dashboard.php" class="sc-btn sc-btn-secondary">
-                Back to Dashboard
-            </a>
-        </div>
 
     </div>
 
