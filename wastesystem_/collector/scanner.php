@@ -113,7 +113,9 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             trim((string)($resident["action_status"] ?? ""))
         );
 
-        $has_payment_record = !empty($resident["approval_history_id"]);
+        $has_payment_record = (
+            $resident["approval_history_id"] !== null
+        );
 
         // APPROVED means PAID, based on your requirement
         $payment_status = ($action_status === "APPROVED")
@@ -264,7 +266,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
             if (
                 empty($resident["household_id"]) ||
-                empty($resident["approval_history_id"]) ||
+                $resident["approval_history_id"] === null ||
                 $latest_action !== "APPROVED"
             ) {
                 throw new Exception(
