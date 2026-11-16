@@ -28,7 +28,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
             if (
                 $schedule_id < 1 ||
-                !in_array($new_status, ["Approved", "Completed", "Rejected"], true)
+                !in_array($new_status, ["Approved", "Rejected"], true)
             ) {
 
                 $error = "Invalid schedule or status.";
@@ -84,7 +84,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
                             $stmt->bind_param("si", $new_status, $schedule_id);
 
-                            if ($stmt->execute()) {
+                            if ($stmt->execute() && $stmt->affected_rows > 0) {
 
                                 $message = "Collection schedule status updated successfully.";
 
@@ -203,7 +203,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
                             } else {
 
-                                $error = "Unable to update the collection schedule.";
+                                $error = "Unable to update the schedule. It may have already been processed.";
                             }
 
                             $stmt->close();
@@ -540,7 +540,7 @@ foreach ($schedules as $s) {
     <div class="schedule-heading">
         <div class="heading-icon"><i class="fas fa-calendar-alt"></i></div>
         <div>
-            <h2 class="page-title">Collection Schedule</h2>
+            <h2 class="page-title">Special Collection Schedule</h2>
             <p class="page-subtitle">Manage collection bookings, review requests, and assign collectors.</p>
         </div>
     </div>
