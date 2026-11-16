@@ -1,7 +1,10 @@
 
+
 <?php
 session_start();
-include "config/database.php";
+
+require_once __DIR__ . "/config/database.php";
+require_once __DIR__ . "/config/send_email.php";
 
 $message = "";
 
@@ -16,10 +19,12 @@ if (isset($_POST["register"])) {
     $username = trim($_POST["username"] ?? "");
     $email = trim($_POST["email"] ?? "");
     $address = trim($_POST["address"] ?? "");
+
     $password = $_POST["password"] ?? "";
     $confirm_password = $_POST["confirm_password"] ?? "";
     $terms = isset($_POST["terms"]);
 
+    // VALIDATION
     if (
         $fullname === "" ||
         $username === "" ||
@@ -47,102 +52,290 @@ if (isset($_POST["register"])) {
 
     } else {
 
-        // Check if username already exists
-        $check = mysqli_prepare(
-            $conn,
-            "SELECT id FROM users WHERE users = ? LIMIT 1"
-        );
+        // CHECK DUPLICATE USERNAME
+        $check = $conn->prepare("
+            SELECT id FROM users
+            WHERE users = ?
+            LIMIT 1
+        ");
 
         if (!$check) {
-            $message = "Database error: " . mysqli_error($conn);
+            $message = "Database error: " . $conn->error;
 
         } else {
 
-            mysqli_stmt_bind_param($check, "s", $username);
-            mysqli_stmt_execute($check);
-            mysqli_stmt_store_result($check);
+            $check->bind_param("s", $username);
+            $check->execute();
 
-            if (mysqli_stmt_num_rows($check) > 0) {
+            $existing_username = $check->get_result()->fetch_assoc();
+            $check->close();
+
+            if ($existing_username) {
+
                 $message = "Username already exists. Please choose another.";
 
             } else {
 
-                // Check if email already exists
-                $check_email = mysqli_prepare(
-                    $conn,
-                    "SELECT id FROM users WHERE email = ? LIMIT 1"
-                );
+                // CHECK DUPLICATE EMAIL
+                $check_email = $conn->prepare("
+                    SELECT id FROM users
+                    WHERE email = ?
+                    LIMIT 1
+                ");
 
                 if (!$check_email) {
-                    $message = "Database error: " . mysqli_error($conn);
+
+                    $message = "Database error: " . $conn->error;
 
                 } else {
 
-                    mysqli_stmt_bind_param($check_email, "s", $email);
-                    mysqli_stmt_execute($check_email);
-                    mysqli_stmt_store_result($check_email);
+                    $check_email->bind_param("s", $email);
+                    $check_email->execute();
 
-                    if (mysqli_stmt_num_rows($check_email) > 0) {
+                    $existing_email = $check_email->get_result()->fetch_assoc();
+                    $check_email->close();
+
+                    if ($existing_email) {
+
                         $message = "Email address is already registered.";
 
                     } else {
 
-                        // Hash the password
+                        // HASH PASSWORD
                         $hashed_password = password_hash(
                             $password,
                             PASSWORD_DEFAULT
                         );
 
-                        // Register resident account
-                        $sql = mysqli_prepare(
-                            $conn,
-                            "INSERT INTO users (fullname, users, email, address, password, role)
-                             VALUES (?, ?, ?, ?, ?, ?)"
+                        // GENERATE SIX-DIGIT OTP
+                        $otp = (string) random_int(100000, 999999);
+
+                        // HASH OTP BEFORE SAVING
+                        $hashed_otp = password_hash(
+                            $otp,
+                            PASSWORD_DEFAULT
                         );
 
-                        if (!$sql) {
-                            $message = "Database error: " . mysqli_error($conn);
+                        // OTP EXPIRES AFTER FIVE MINUTES
+                        $expires_at = date(
+                            "Y-m-d H:i:s",
+                            time() + 300
+                        );
 
-                        } else {
+                        $role = "residents";
+                        $email_verified = 0;
 
-                            $role = "residents";
+                        try {
 
-                            mysqli_stmt_bind_param(
-                                $sql,
-                                "ssssss",
+                            $conn->begin_transaction();
+
+                            // CREATE UNVERIFIED RESIDENT ACCOUNT
+                            $insert = $conn->prepare("
+                                INSERT INTO users
+                                (
+                                    fullname,
+                                    users,
+                                    email,
+                                    address,
+                                    password,
+                                    role,
+                                    email_verified
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ");
+
+                            if (!$insert) {
+                                throw new Exception($conn->error);
+                            }
+
+                            $insert->bind_param(
+                                "ssssssi",
                                 $fullname,
                                 $username,
                                 $email,
                                 $address,
                                 $hashed_password,
-                                $role
+                                $role,
+                                $email_verified
                             );
 
-                            if (mysqli_stmt_execute($sql)) {
-                                mysqli_stmt_close($sql);
-                                mysqli_stmt_close($check_email);
-                                mysqli_stmt_close($check);
-
-                                header("Location: index.php?registered=1");
-                                exit;
-
-                            } else {
-                                $message = "Registration failed: " . mysqli_stmt_error($sql);
+                            if (!$insert->execute()) {
+                                throw new Exception($insert->error);
                             }
 
-                            mysqli_stmt_close($sql);
+                            $user_id = $conn->insert_id;
+                            $insert->close();
+
+                            // REMOVE ANY OLD OTP RECORDS FOR THIS USER
+                            $delete_otp = $conn->prepare("
+                                DELETE FROM email_otps
+                                WHERE user_id = ?
+                            ");
+
+                            if (!$delete_otp) {
+                                throw new Exception($conn->error);
+                            }
+
+                            $delete_otp->bind_param("i", $user_id);
+
+                            if (!$delete_otp->execute()) {
+                                throw new Exception($delete_otp->error);
+                            }
+
+                            $delete_otp->close();
+
+                            // SAVE NEW HASHED OTP
+                            $otp_stmt = $conn->prepare("
+                                INSERT INTO email_otps
+                                (
+                                    user_id,
+                                    otp_code,
+                                    expires_at,
+                                    attempts,
+                                    created_at
+                                )
+                                VALUES (?, ?, ?, 0, NOW())
+                            ");
+
+                            if (!$otp_stmt) {
+                                throw new Exception($conn->error);
+                            }
+
+                            $otp_stmt->bind_param(
+                                "iss",
+                                $user_id,
+                                $hashed_otp,
+                                $expires_at
+                            );
+
+                            if (!$otp_stmt->execute()) {
+                                throw new Exception($otp_stmt->error);
+                            }
+
+                            $otp_stmt->close();
+
+                            // COMMIT ACCOUNT AND OTP
+                            $conn->commit();
+
+                            // SEND OTP EMAIL
+                            $safe_name = htmlspecialchars(
+                                $fullname,
+                                ENT_QUOTES,
+                                "UTF-8"
+                            );
+
+                            $subject = "EcoTrack Email Verification Code";
+
+                            $body = "
+                                <div style='font-family:Arial,sans-serif;
+                                            max-width:600px;
+                                            margin:auto;
+                                            padding:25px;
+                                            border:1px solid #ddd;
+                                            border-radius:12px;'>
+
+                                    <h2 style='color:#198754;'>
+                                        Welcome to EcoTrack!
+                                    </h2>
+
+                                    <p>Hello {$safe_name},</p>
+
+                                    <p>
+                                        Thank you for registering with
+                                        the Waste Collection Management System.
+                                    </p>
+
+                                    <p>
+                                        Please use the following OTP
+                                        to verify your email address:
+                                    </p>
+
+                                    <div style='background:#eaf5ed;
+                                                padding:20px;
+                                                text-align:center;
+                                                border-radius:10px;
+                                                margin:20px 0;'>
+
+                                        <h1 style='color:#198754;
+                                                   letter-spacing:8px;
+                                                   margin:0;'>
+                                            {$otp}
+                                        </h1>
+
+                                    </div>
+
+                                    <p>
+                                        This verification code expires
+                                        in <strong>5 minutes</strong>.
+                                    </p>
+
+                                    <p>
+                                        If you did not create this account,
+                                        you can ignore this email.
+                                    </p>
+
+                                    <p>
+                                        Regards,<br>
+                                        EcoTrack Team
+                                    </p>
+
+                                </div>
+                            ";
+
+                            
+// KEEP ACCOUNT UNVERIFIED IF EMAIL FAILS.
+$_SESSION["pending_verification_user"] = $user_id;
+
+// SEND EMAIL WITHOUT BREAKING SUCCESSFUL REGISTRATION
+$email_sent = false;
+
+try {
+
+    $email_sent = sendEmail($email, $subject, $body);
+
+} catch (Throwable $email_error) {
+
+    error_log(
+        "OTP Email Error: " . $email_error->getMessage()
+    );
+
+    $email_sent = false;
+}
+
+if ($email_sent) {
+
+    $_SESSION["verification_notice"] =
+        "A verification code has been sent to your email address.";
+
+} else {
+
+    $_SESSION["verification_notice"] =
+        "Your account was created, but the verification email could not be sent. Please use Resend OTP.";
+
+}
+
+                            // REDIRECT TO OTP VERIFICATION PAGE
+                            header("Location: verify_email.php");
+                            exit;
+
+                        } catch (Throwable $e) {
+
+                            $conn->rollback();
+
+                            error_log(
+                                "Registration error: " . $e->getMessage()
+                            );
+
+                            $message = "Registration failed. Please try again.";
                         }
                     }
-
-                    mysqli_stmt_close($check_email);
                 }
             }
-
-            mysqli_stmt_close($check);
         }
     }
 }
 ?>
+
 
 <!DOCTYPE html>
 <html lang="en">

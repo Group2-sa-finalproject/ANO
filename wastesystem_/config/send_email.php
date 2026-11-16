@@ -1,18 +1,18 @@
+
 <?php
+
+require_once __DIR__ . "/../vendor/autoload.php";
+require_once __DIR__ . "/email_config.php";
 
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception;
 
-require_once __DIR__ . '/../vendor/autoload.php';
-require_once __DIR__ . '/email_config.php';
-
 function sendEmail($recipient, $subject, $body)
 {
-    $mail = new PHPMailer(true);
-
     try {
-        $mail->isSMTP();
+        $mail = new PHPMailer(true);
 
+        $mail->isSMTP();
         $mail->Host       = MAIL_HOST;
         $mail->SMTPAuth   = true;
         $mail->Username   = MAIL_USERNAME;
@@ -26,17 +26,14 @@ function sendEmail($recipient, $subject, $body)
         $mail->isHTML(true);
         $mail->Subject = $subject;
         $mail->Body    = $body;
-
         $mail->AltBody = strip_tags($body);
 
         $mail->send();
 
         return true;
 
-    } catch (Exception $e) {
-
-        error_log("Email sending failed: " . $mail->ErrorInfo);
-
+    } catch (Throwable $e) {
+        error_log("PHPMailer Error: " . $e->getMessage());
         return false;
     }
 }
