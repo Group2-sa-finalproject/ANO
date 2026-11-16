@@ -23,8 +23,36 @@ if (!isset($conn) || !($conn instanceof mysqli)) {
 
 mysqli_set_charset($conn, "utf8mb4");
 
+/*
+|--------------------------------------------------------------------------
+| ADMIN NOTIFICATIONS TABLE
+|--------------------------------------------------------------------------
+| This creates the in-system notification table if it does not exist.
+| user_id stores the admin account that should receive the notification.
+*/
+
+$create_notifications_table = $conn->query("
+    CREATE TABLE IF NOT EXISTS notifications (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        type VARCHAR(50) DEFAULT 'subscription',
+        related_id INT DEFAULT NULL,
+        is_read TINYINT(1) NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_notifications_user_read (user_id, is_read),
+        INDEX idx_notifications_related (related_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+");
+
+if (!$create_notifications_table) {
+    die("Unable to prepare the admin notifications table: " . escapeHtml($conn->error));
+}
+
 $user_id = (int) $_SESSION['user_id'];
 $monthly_fee = 150.00;
+
 
 /*
 |--------------------------------------------------------------------------
@@ -156,10 +184,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' &&
                 SELECT COALESCE(SUM(points_redeemed), 0) AS total_points
                 FROM subscription_point_redemptions
                 WHERE user_id = ?
-                  AND subscription_id IS NULL
-                FOR UPDATE
+                AND subscription_id IS NULL
             ");
-
             if (!$stmt) {
                 throw new Exception("Unable to retrieve reserved Eco Points.");
             }
@@ -228,7 +254,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' &&
             }
 
             $stmt->bind_param(
-                "ididddd",
+                "iddiddd",
                 $user_id,
                 $monthly_fee,
                 $monthly_fee,
@@ -243,6 +269,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' &&
             }
 
             $subscription_id = $conn->insert_id;
+
+            $stmt->close();
+
+            /*
+            |--------------------------------------------------------------
+            | AUTOMATIC ADMIN NOTIFICATION
+            |--------------------------------------------------------------
+            | Notify every admin account immediately when a resident submits.
+            | This is an in-system notification, not an email.
+            */
+
+            $notification_title = "New Subscription Request";
+            $notification_message = $resident_name .
+                " has submitted a new waste collection subscription (Subscription #" .
+                $subscription_id .
+                "). Please review the application and payment status.";
+            $notification_type = "subscription";
+
+            $stmt = $conn->prepare("
+                INSERT INTO notifications (
+                    user_id, title, message, type, related_id, is_read
+                )
+                SELECT id, ?, ?, ?, ?, 0
+                FROM users
+                WHERE role = 'admin'
+            ");
+
+            if (!$stmt) {
+                throw new Exception("Unable to prepare the administrator notification.");
+            }
+
+            $stmt->bind_param(
+                "sssi",
+                $notification_title,
+                $notification_message,
+                $notification_type,
+                $subscription_id
+            );
+
+            if (!$stmt->execute()) {
+                throw new Exception("Unable to send the administrator notification.");
+            }
+
+            if ($stmt->affected_rows < 1) {
+                throw new Exception("No administrator account was found to receive the notification.");
+            }
 
             $stmt->close();
 
@@ -284,105 +356,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' &&
 
             $conn->commit();
 
-            $success_message = "Your subscription request has been submitted successfully.";
+            $success_message = "Your subscription request has been submitted successfully. The administrator has been notified automatically.";
 
         } catch (Exception $e) {
 
             $conn->rollback();
 
             $error_message = $e->getMessage();
-        }
-    }
-}
-
-/*
-|--------------------------------------------------------------------------
-| SUBMIT CASH PAYMENT NOTICE
-|--------------------------------------------------------------------------
-*/
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST' &&
-    isset($_POST['submit_cash_notice'])) {
-
-    if (
-        !isset($_POST['csrf_token']) ||
-        !hash_equals($csrf_token, $_POST['csrf_token'])
-    ) {
-        $error_message = "Invalid request. Please refresh the page and try again.";
-
-    } else {
-
-        $subscription_id = (int) ($_POST['subscription_id'] ?? 0);
-
-        $stmt = $conn->prepare("
-            SELECT id, payment_status, total_amount, amount_paid, balance_due
-            FROM subscriptions
-            WHERE id = ?
-              AND user_id = ?
-            LIMIT 1
-        ");
-
-        if (!$stmt) {
-
-            $error_message = "Unable to verify your subscription.";
-
-        } else {
-
-            $stmt->bind_param(
-                "ii",
-                $subscription_id,
-                $user_id
-            );
-
-            $stmt->execute();
-
-            $subscription_record = $stmt->get_result()->fetch_assoc();
-
-            $stmt->close();
-
-            if (!$subscription_record) {
-
-                $error_message = "Subscription record not found.";
-
-            } elseif (
-                strtolower($subscription_record['payment_status']) === 'paid'
-            ) {
-
-                $error_message = "Your subscription has already been paid.";
-
-            } else {
-
-                $stmt = $conn->prepare("
-                    UPDATE subscriptions
-                    SET payment_status = 'Pending Confirmation'
-                    WHERE id = ?
-                      AND user_id = ?
-                ");
-
-                if (!$stmt) {
-
-                    $error_message = "Unable to submit your payment notice.";
-
-                } else {
-
-                    $stmt->bind_param(
-                        "ii",
-                        $subscription_id,
-                        $user_id
-                    );
-
-                    if ($stmt->execute()) {
-
-                        $success_message = "Your cash payment notice has been submitted. Please wait for administrator confirmation.";
-
-                    } else {
-
-                        $error_message = "Unable to submit your payment notice.";
-                    }
-
-                    $stmt->close();
-                }
-            }
         }
     }
 }
@@ -511,12 +491,24 @@ $stmt = $conn->prepare("
     LIMIT 1
 ");
 
-if ($stmt) {
+if (!$stmt) {
+
+    $error_message = "Subscription query error: " . $conn->error;
+
+} else {
 
     $stmt->bind_param("i", $user_id);
-    $stmt->execute();
 
-    $subscription = $stmt->get_result()->fetch_assoc();
+    if (!$stmt->execute()) {
+
+        $error_message = "Subscription execution error: " . $stmt->error;
+
+    } else {
+
+        $result = $stmt->get_result();
+        $subscription = $result->fetch_assoc();
+
+    }
 
     $stmt->close();
 }
@@ -559,7 +551,6 @@ if ($subscription) {
 $can_print_soa = false;
 $is_pending_payment = false;
 $is_paid = false;
-$can_submit_cash_notice = false;
 
 if ($subscription) {
 
@@ -575,11 +566,6 @@ if ($subscription) {
 
     $is_pending_payment = (
         $payment_status === 'pending confirmation'
-    );
-
-    $can_submit_cash_notice = (
-        !$is_paid &&
-        !$is_pending_payment
     );
 
     $can_print_soa = true;
@@ -1126,6 +1112,119 @@ a {
     font-size: 19px;
 }
 
+/* SOA document layout based on the supplied reference design. */
+.soa-print {
+    color: #26332b;
+    font-family: Arial, sans-serif;
+}
+
+.soa-document-header {
+    text-align: center;
+    border-bottom: 2px solid #222;
+    padding-bottom: 18px;
+    margin-bottom: 20px;
+}
+
+.soa-document-header h1 {
+    color: #183d2b;
+    font-size: 25px;
+    font-weight: 800;
+    margin: 0 0 5px;
+}
+
+.soa-document-header h2 {
+    color: #222;
+    font-size: 20px;
+    margin: 25px 0 5px;
+}
+
+.soa-document-header p {
+    margin: 4px 0;
+    font-size: 12px;
+}
+
+.soa-document-header .soa-subtitle {
+    color: #6f7e74;
+    letter-spacing: 1px;
+}
+
+.soa-print h3 {
+    color: #183d2b;
+    font-size: 15px;
+    font-weight: 700;
+    margin: 22px 0 8px;
+}
+
+.soa-section-heading {
+    margin-top: 25px !important;
+}
+
+.soa-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 20px;
+}
+
+.soa-table td {
+    padding: 10px;
+    border-bottom: 1px solid #e2e7e3;
+}
+
+.soa-table td:first-child {
+    color: #435248;
+}
+
+.soa-table td:last-child {
+    text-align: right;
+    font-weight: 600;
+}
+
+.soa-balance-row {
+    font-size: 17px;
+    background: #edf7ef;
+}
+
+.soa-balance-row td {
+    border-top: 2px solid #cbd9ce;
+}
+
+.soa-important-notice {
+    margin-top: 30px;
+    padding: 15px;
+    border: 1px solid #aaa;
+    font-size: 12px;
+}
+
+.soa-important-notice p {
+    margin: 8px 0 0;
+}
+
+.soa-signatures {
+    display: flex;
+    justify-content: space-between;
+    gap: 30px;
+    margin-top: 60px;
+}
+
+.soa-signature {
+    width: 45%;
+    text-align: center;
+    font-size: 12px;
+}
+
+.soa-signature-line {
+    border-top: 1px solid #333;
+    height: 1px;
+    margin-bottom: 8px;
+}
+
+.soa-thank-you {
+    text-align: center;
+    margin-top: 40px;
+    font-size: 12px;
+}
+
+
 /* =========================================================
    RESPONSIVE
 ========================================================= */
@@ -1196,38 +1295,112 @@ a {
 
 @media print {
 
-    body {
-        background: #fff;
+    @page {
+        size: A4;
+        margin: 15mm;
     }
 
-    .sidebar,
-    .topbar,
-    .page-heading,
-    .no-print,
-    .alert,
-    .summary-grid {
+    html,
+    body {
+        width: 100% !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        background: #fff !important;
+    }
+
+    /* Hide every page element, then show only the SOA document. */
+    body * {
+        visibility: hidden !important;
+    }
+
+    #soa,
+    #soa * {
+        visibility: visible !important;
+    }
+
+    #soa {
+        position: absolute !important;
+        left: 0 !important;
+        top: 0 !important;
+        width: 100% !important;
+        margin: 0 !important;
+        padding: 20px !important;
+        border: 1px solid #ccc !important;
+        border-radius: 0 !important;
+        box-shadow: none !important;
+        background: #fff !important;
+        color: #000 !important;
+        font-family: Arial, sans-serif !important;
+        font-size: 12px !important;
+    }
+
+    #soa h1,
+    #soa h2,
+    #soa h3,
+    #soa p,
+    #soa td,
+    #soa strong {
+        color: #000 !important;
+    }
+
+    #soa .soa-table {
+        width: 100% !important;
+        border-collapse: collapse !important;
+        margin-bottom: 22px !important;
+    }
+
+    #soa .soa-table td {
+        padding: 10px !important;
+        border-bottom: 1px solid #ccc !important;
+        vertical-align: top !important;
+    }
+
+    #soa .soa-table td:last-child {
+        text-align: right !important;
+        font-weight: 600 !important;
+    }
+
+    #soa .soa-balance-row {
+        font-size: 16px !important;
+        border-top: 2px solid #222 !important;
+    }
+
+    #soa .soa-important-notice {
+        border: 1px solid #888 !important;
+        padding: 15px !important;
+        margin-top: 25px !important;
+        break-inside: avoid;
+    }
+
+    #soa .soa-signatures {
+        display: flex !important;
+        justify-content: space-between !important;
+        gap: 30px !important;
+        margin-top: 55px !important;
+        break-inside: avoid;
+    }
+
+    #soa .soa-signature {
+        width: 45% !important;
+        text-align: center !important;
+    }
+
+    #soa .soa-signature-line {
+        border-top: 1px solid #222 !important;
+        margin-bottom: 8px !important;
+        height: 1px !important;
+    }
+
+    #soa .soa-thank-you {
+        text-align: center !important;
+        margin-top: 35px !important;
+        font-size: 11px !important;
+    }
+
+    .no-print {
         display: none !important;
     }
-
-    .main-content {
-        margin: 0;
-    }
-
-    .content {
-        padding: 0;
-    }
-
-    .subscription-card {
-        box-shadow: none;
-        border: none;
-        padding: 0;
-    }
-
-    .soa-print {
-        border: none;
-        padding: 0;
-    }
-
 }
 
 </style>
@@ -1568,14 +1741,19 @@ a {
                 <?php endif; ?>
 
 
+                
                 <form method="POST" class="subscription-confirm-form">
 
                     <input type="hidden"
-                           name="csrf_token"
-                           value="<?= escapeHtml($csrf_token); ?>">
+                        name="csrf_token"
+                        value="<?= escapeHtml($csrf_token); ?>">
+
+                    <!-- Important: This ensures PHP receives the handler name -->
+                    <input type="hidden"
+                        name="create_subscription"
+                        value="1">
 
                     <button type="submit"
-                            name="create_subscription"
                             class="btn btn-ecotrack">
 
                         <i class="fas fa-paper-plane me-2"></i>
@@ -1584,6 +1762,7 @@ a {
                     </button>
 
                 </form>
+
 
 
             <?php else: ?>
@@ -1822,7 +2001,7 @@ a {
             </h4>
 
             <p class="card-description">
-                Review your payment status and submit your cash payment notice when applicable.
+                Review your current payment status. Payment confirmation will be handled by the administrator.
             </p>
 
 
@@ -1844,8 +2023,7 @@ a {
 
                     <i class="fas fa-clock me-2"></i>
 
-                    Your cash payment notice is currently pending confirmation.
-                    Please wait for the administrator to verify your payment.
+                    Your payment is awaiting administrator confirmation. Please wait for the administrator to update your payment status.
 
                 </div>
 
@@ -1856,38 +2034,11 @@ a {
 
                     <i class="fas fa-info-circle me-2"></i>
 
-                    Your payment is not yet confirmed.
-
-                    Please coordinate your cash payment with the authorized
-                    collection personnel.
+                    Your payment is currently <strong>Unpaid</strong>.
+                    Please coordinate payment with the authorized collection personnel.
+                    The administrator will update your payment record after verification.
 
                 </div>
-
-
-                <?php if ($can_submit_cash_notice): ?>
-
-                    <form method="POST" class="cash-payment-confirm-form">
-
-                        <input type="hidden"
-                               name="csrf_token"
-                               value="<?= escapeHtml($csrf_token); ?>">
-
-                        <input type="hidden"
-                               name="subscription_id"
-                               value="<?= (int) $subscription['id']; ?>">
-
-                        <button type="submit"
-                                name="submit_cash_notice"
-                                class="btn btn-ecotrack">
-
-                            <i class="fas fa-money-bill-wave me-2"></i>
-                            Submit Cash Payment Notice
-
-                        </button>
-
-                    </form>
-
-                <?php endif; ?>
 
             <?php endif; ?>
 
@@ -1949,16 +2100,15 @@ a {
 
 
 
-        <!-- STATEMENT OF ACCOUNT -->
+                <!-- STATEMENT OF ACCOUNT -->
 
         <?php if ($can_print_soa): ?>
 
-            <section class="subscription-card">
+            <section class="subscription-card soa-section">
 
                 <div class="d-flex justify-content-between align-items-center mb-3 no-print">
 
                     <div>
-
                         <h4 class="mb-1">
                             <i class="fas fa-file-invoice me-2"></i>
                             Statement of Account
@@ -1967,156 +2117,116 @@ a {
                         <p class="card-description mb-0">
                             View and print your subscription billing statement.
                         </p>
-
                     </div>
 
                     <button type="button"
                             onclick="window.print()"
                             class="btn btn-outline-ecotrack">
-
                         <i class="fas fa-print me-2"></i>
                         Print SOA
-
                     </button>
 
                 </div>
 
+                <!-- This is the only section included in the printout. -->
+                <div class="soa-print" id="soa">
 
-                <div class="soa-print">
-
-                    <div class="soa-header">
-
-                        <h3>EcoTrack</h3>
-
-                        <p>Waste Collection Management System</p>
-
-                        <p>STATEMENT OF ACCOUNT</p>
-
+                    <div class="soa-document-header">
+                        <h1>ECO TRACK</h1>
+                        <h2>STATEMENT OF ACCOUNT</h2>
+                        <p class="soa-subtitle">SUBSCRIPTION PAYMENT SLIP</p>
                     </div>
 
+                    <hr>
 
-                    <div class="detail-row">
+                    <h3>Resident Information</h3>
 
-                        <span class="detail-label">
-                            Resident Name
-                        </span>
+                    <table class="soa-table">
+                        <tr>
+                            <td>Resident Name</td>
+                            <td><?= escapeHtml($resident_name); ?></td>
+                        </tr>
+                        <tr>
+                            <td>Resident ID</td>
+                            <td><?= (int) $user_id; ?></td>
+                        </tr>
+                        <tr>
+                            <td>Subscription ID</td>
+                            <td>#<?= (int) $subscription['id']; ?></td>
+                        </tr>
+                        <tr>
+                            <td>Subscription Date</td>
+                            <td>
+                                <?= !empty($subscription['created_at'])
+                                    ? date('F d, Y', strtotime($subscription['created_at']))
+                                    : 'N/A'; ?>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>Statement Printed</td>
+                            <td><?= date('F d, Y h:i A'); ?></td>
+                        </tr>
+                    </table>
 
-                        <span class="detail-value">
-                            <?= escapeHtml($resident_name); ?>
-                        </span>
+                    <h3 class="soa-section-heading">Subscription Payment Breakdown</h3>
 
-                    </div>
+                    <table class="soa-table">
+                        <tr>
+                            <td>Monthly Subscription Fee</td>
+                            <td><?= peso($original_amount); ?></td>
+                        </tr>
+                        <tr>
+                            <td>Subscription Duration</td>
+                            <td><?= (int) $months; ?> month(s)</td>
+                        </tr>
+                        <tr>
+                            <td>Eco Points Redeemed</td>
+                            <td><?= number_format((int) $subscription_points); ?></td>
+                        </tr>
+                        <tr>
+                            <td>Eco Points Discount</td>
+                            <td><?= peso($discount_amount); ?></td>
+                        </tr>
+                        <tr>
+                            <td><strong>Total Subscription Amount</strong></td>
+                            <td><strong><?= peso($total_amount); ?></strong></td>
+                        </tr>
+                        <tr>
+                            <td>Amount Paid / Recorded</td>
+                            <td><?= peso($amount_paid); ?></td>
+                        </tr>
+                        <tr class="soa-balance-row">
+                            <td><strong>Remaining Balance</strong></td>
+                            <td><strong><?= peso($balance_due); ?></strong></td>
+                        </tr>
+                    </table>
 
+                    <h3 class="soa-section-heading">Payment Information</h3>
 
-                    <div class="detail-row">
+                    <table class="soa-table">
+                        <tr>
+                            <td>Payment Method</td>
+                            <td>Cash Simulation</td>
+                        </tr>
+                        <tr>
+                            <td>Payment Status</td>
+                            <td><?= escapeHtml($subscription['payment_status'] ?? 'Unpaid'); ?></td>
+                        </tr>
+                        <tr>
+                            <td>Subscription Status</td>
+                            <td><?= escapeHtml($subscription['subscription_status'] ?? 'Pending Approval'); ?></td>
+                        </tr>
+                    </table>
 
-                        <span class="detail-label">
-                            Subscription Number
-                        </span>
-
-                        <span class="detail-value">
-                            #<?= (int) $subscription['id']; ?>
-                        </span>
-
-                    </div>
-
-
-                    <div class="detail-row">
-
-                        <span class="detail-label">
-                            Statement Date
-                        </span>
-
-                        <span class="detail-value">
-                            <?= date('F d, Y'); ?>
-                        </span>
-
-                    </div>
-
-
-                    <div class="detail-row">
-
-                        <span class="detail-label">
-                            Service Fee
-                        </span>
-
-                        <span class="detail-value">
-                            <?= peso($original_amount); ?>
-                        </span>
-
-                    </div>
-
-
-                    <div class="detail-row">
-
-                        <span class="detail-label">
-                            Eco Points Discount
-                        </span>
-
-                        <span class="detail-value text-success">
-                            - <?= peso($discount_amount); ?>
-                        </span>
-
-                    </div>
-
-
-                    <div class="detail-row">
-
-                        <span class="detail-label">
-                            Total Amount
-                        </span>
-
-                        <span class="detail-value">
-                            <?= peso($total_amount); ?>
-                        </span>
-
-                    </div>
-
-
-                    <div class="detail-row">
-
-                        <span class="detail-label">
-                            Amount Paid
-                        </span>
-
-                        <span class="detail-value">
-                            <?= peso($amount_paid); ?>
-                        </span>
-
-                    </div>
-
-
-                    <div class="soa-total">
-
-                        <div class="d-flex justify-content-between align-items-center">
-
-                            <span>
-                                <strong>Remaining Balance</strong>
-                            </span>
-
-                            <strong>
-                                <?= peso($balance_due); ?>
-                            </strong>
-
-                        </div>
-
-                    </div>
-
-
-                    <div class="text-center mt-4">
-
-                        <small class="text-muted">
-                            This is a system-generated statement of account.
-                        </small>
-
-                    </div>
+                    <p class="soa-thank-you">
+                        Thank you for supporting our waste management program!
+                    </p>
 
                 </div>
 
             </section>
 
         <?php endif; ?>
-
 
         <?php endif; ?>
 
@@ -2139,23 +2249,17 @@ a {
 
 <script src="../assets/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-<script src="../assets/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
 
-</body>
-</html>
 <script>
 document.addEventListener("DOMContentLoaded", function () {
 
-    // SUBSCRIPTION CONFIRMATION
     document.querySelectorAll(".subscription-confirm-form").forEach(function(form) {
-
         form.addEventListener("submit", function(event) {
-
             event.preventDefault();
 
             Swal.fire({
                 title: "Submit Subscription?",
-                text: "Are you sure you want to submit your waste collection subscription application?",
+                text: "Are you sure you want to submit your subscription application?",
                 icon: "question",
                 showCancelButton: true,
                 confirmButtonColor: "#17643b",
@@ -2164,46 +2268,17 @@ document.addEventListener("DOMContentLoaded", function () {
                 cancelButtonText: "Review Again",
                 reverseButtons: true
             }).then(function(result) {
-
                 if (result.isConfirmed) {
                     form.submit();
                 }
-
             });
-
         });
-
     });
 
 
-    // CASH PAYMENT NOTICE CONFIRMATION
-    document.querySelectorAll(".cash-payment-confirm-form").forEach(function(form) {
-
-        form.addEventListener("submit", function(event) {
-
-            event.preventDefault();
-
-            Swal.fire({
-                title: "Submit Cash Payment Notice?",
-                text: "Are you sure you have already made your cash payment and want to notify the administrator for confirmation?",
-                icon: "warning",
-                showCancelButton: true,
-                confirmButtonColor: "#17643b",
-                cancelButtonColor: "#6c757d",
-                confirmButtonText: "Yes, Submit Notice",
-                cancelButtonText: "Go Back",
-                reverseButtons: true
-            }).then(function(result) {
-
-                if (result.isConfirmed) {
-                    form.submit();
-                }
-
-            });
-
-        });
-
-    });
 
 });
 </script>
+
+</body>
+</html>
