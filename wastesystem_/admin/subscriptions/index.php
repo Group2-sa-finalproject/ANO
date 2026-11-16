@@ -78,14 +78,21 @@ $success_message = '';
 $error_message = '';
 
 // =====================================================
-// PROCESS CONFIRMATION AND REJECTION
+// PROCESS APPROVAL AND REJECTION
 // =====================================================
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $posted_token = $_POST['csrf_token'] ?? '';
     $subscription_id = filter_input(INPUT_POST, 'subscription_id', FILTER_VALIDATE_INT);
-    $action = $_POST['action'] ?? '';
+
+    if (isset($_POST['confirm'])) {
+        $action = 'confirm';
+    } elseif (isset($_POST['reject'])) {
+        $action = 'reject';
+    } else {
+        $action = '';
+    }
 
     if (
         !is_string($posted_token) ||
@@ -94,11 +101,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $error_message = 'Your session token is invalid. Please refresh the page.';
 
     } elseif (!$subscription_id || $subscription_id < 1) {
-
         $error_message = 'Invalid subscription record.';
 
     } elseif (!in_array($action, ['confirm', 'reject'], true)) {
-
         $error_message = 'Invalid administrator action.';
 
     } else {
@@ -111,8 +116,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $lock_stmt = $conn->prepare("
                 SELECT
                     id,
+                    user_id,
                     total_amount,
-                    payment_status,
                     subscription_status
                 FROM subscriptions
                 WHERE id = ?
@@ -138,52 +143,68 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             if ($subscription['subscription_status'] !== 'Pending Approval') {
-                throw new Exception('This subscription has already been processed. Please refresh the page.');
+                throw new Exception(
+                    'This subscription has already been processed. Please refresh the page.'
+                );
             }
 
-            $admin_id = (int)$_SESSION['user_id'];
+            $admin_id = (int) $_SESSION['user_id'];
 
-            // =================================================
-            // CONFIRM PAYMENT NOTICE
-            // =================================================
+            // =============================================
+            // APPROVE: ACTIVE + PAID
+            // =============================================
 
             if ($action === 'confirm') {
-
-                // Only confirm an actual submitted payment notice.
-                if ($subscription['payment_status'] !== 'Pending Confirmation') {
-                    throw new Exception(
-                        'This resident has not submitted a payment notice. Only Pending Confirmation records can be confirmed.'
-                    );
-                }
 
                 $update_stmt = $conn->prepare("
                     UPDATE subscriptions
                     SET
-                        amount_paid = total_amount,
-                        balance_due = 0.00,
+                        subscription_status = 'Active',
                         payment_status = 'Paid',
-                        subscription_status = 'Active'
+                        amount_paid = total_amount,
+                        balance_due = 0.00
                     WHERE id = ?
-                      AND payment_status = 'Pending Confirmation'
-                      AND subscription_status = 'Pending Approval'
+                    AND subscription_status = 'Pending Approval'
                 ");
 
                 if (!$update_stmt) {
-                    throw new Exception('Unable to prepare payment confirmation.');
+                    throw new Exception('Failed to prepare subscription approval.');
                 }
 
                 $update_stmt->bind_param('i', $subscription_id);
 
                 if (!$update_stmt->execute()) {
-                    throw new Exception('Unable to confirm payment.');
+                    throw new Exception('Failed to approve subscription.');
                 }
 
                 if ($update_stmt->affected_rows !== 1) {
                     $update_stmt->close();
-                    throw new Exception('Payment could not be confirmed. Please refresh the page.');
+                    throw new Exception('Subscription could not be approved. Please refresh the page.');
                 }
 
                 $update_stmt->close();
+
+                // RECORD THE AUTOMATICALLY CONFIRMED PAYMENT
+                $resident_id = (int) $subscription['user_id'];
+                $payment_amount = (float) $subscription['total_amount'];
+
+                $payment_stmt = $conn->prepare("
+                    INSERT INTO resident_payments
+                        (user_id, amount, status, paid_at)
+                    VALUES (?, ?, 'Paid', NOW())
+                ");
+
+                if (!$payment_stmt) {
+                    throw new Exception('Failed to prepare resident payment record.');
+                }
+
+                $payment_stmt->bind_param('id', $resident_id, $payment_amount);
+
+                if (!$payment_stmt->execute()) {
+                    throw new Exception('Failed to save resident payment record.');
+                }
+
+                $payment_stmt->close();
 
                 // SAVE APPROVAL HISTORY
                 $history_stmt = $conn->prepare("
@@ -193,43 +214,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ");
 
                 if (!$history_stmt) {
-                    throw new Exception('Unable to prepare approval history.');
+                    throw new Exception('Failed to prepare approval history.');
                 }
 
                 $history_stmt->bind_param('ii', $subscription_id, $admin_id);
 
                 if (!$history_stmt->execute()) {
-                    throw new Exception('Unable to save approval history.');
+                    throw new Exception('Failed to save approval history.');
                 }
 
                 $history_stmt->close();
 
                 $success_message =
-                    'Payment notice successfully confirmed. The subscription is now Active and Paid.';
+                    'Subscription approved successfully. Its payment is automatically marked as Paid.';
 
             } else {
 
-                // =================================================
-                // REJECT SUBSCRIPTION
-                // =================================================
+                // =============================================
+                // REJECT: REMAIN UNPAID
+                // =============================================
 
                 $update_stmt = $conn->prepare("
                     UPDATE subscriptions
                     SET
+                        subscription_status = 'Rejected',
                         payment_status = 'Unpaid',
-                        subscription_status = 'Rejected'
+                        amount_paid = 0.00,
+                        balance_due = total_amount
                     WHERE id = ?
-                      AND subscription_status = 'Pending Approval'
+                    AND subscription_status = 'Pending Approval'
                 ");
 
                 if (!$update_stmt) {
-                    throw new Exception('Unable to prepare subscription rejection.');
+                    throw new Exception('Failed to prepare subscription rejection.');
                 }
 
                 $update_stmt->bind_param('i', $subscription_id);
 
                 if (!$update_stmt->execute()) {
-                    throw new Exception('Unable to reject subscription.');
+                    throw new Exception('Failed to reject subscription.');
                 }
 
                 if ($update_stmt->affected_rows !== 1) {
@@ -247,24 +270,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ");
 
                 if (!$history_stmt) {
-                    throw new Exception('Unable to prepare rejection history.');
+                    throw new Exception('Failed to prepare rejection history.');
                 }
 
                 $history_stmt->bind_param('ii', $subscription_id, $admin_id);
 
                 if (!$history_stmt->execute()) {
-                    throw new Exception('Unable to save rejection history.');
+                    throw new Exception('Failed to save rejection history.');
                 }
 
                 $history_stmt->close();
 
                 $success_message =
-                    'Subscription successfully rejected. It will no longer appear in pending records.';
+                    'Subscription rejected successfully. It will no longer appear in pending records.';
             }
 
+            // SAVE ALL CHANGES TOGETHER
             $conn->commit();
 
-            // NEW CSRF TOKEN
+            // GENERATE A NEW CSRF TOKEN
             $_SESSION['subscription_admin_csrf'] = bin2hex(random_bytes(32));
 
         } catch (Throwable $exception) {
@@ -278,8 +302,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
+
 // =====================================================
-// RETRIEVE PENDING AND UNPAID SUBSCRIPTIONS
+// RETRIEVE PENDING APPROVAL SUBSCRIPTIONS ONLY
 // =====================================================
 
 $list_sql = "
@@ -301,12 +326,7 @@ $list_sql = "
         s.created_at
     FROM subscriptions AS s
     INNER JOIN users AS u ON u.id = s.user_id
-    WHERE
-        s.subscription_status <> 'Rejected'
-        AND (
-            s.subscription_status = 'Pending Approval'
-            OR s.payment_status <> 'Paid'
-        )
+    WHERE s.subscription_status = 'Pending Approval'
     ORDER BY s.created_at DESC, s.id DESC
 ";
 
@@ -1271,10 +1291,10 @@ $history_count = $history_result->num_rows;
     <div class="subs-alert warning">
         <i class="fas fa-circle-info"></i>
         <div>
-            <strong>School-project simulation:</strong>
-            Cash Simulation is only a simulated payment notice.
-            This page does not receive or process real money.
-            The administrator must manually verify and confirm each notice.
+            <strong>Payment Approval Notice:</strong>
+            The administrator's approval of a resident's subscription
+            automatically confirms the simulated cash payment and marks
+            the subscription as Paid. No separate payment confirmation is required.
         </div>
     </div>
 
@@ -1325,7 +1345,7 @@ $history_count = $history_result->num_rows;
                 </h3>
 
                 <p class="subs-card-caption">
-                    Review subscriptions that are pending approval or have unpaid balances.
+                    Review and manage subscriptions awaiting administrator approval.
                 </p>
             </div>
 
@@ -1495,8 +1515,8 @@ $history_count = $history_result->num_rows;
 
                 <div class="subs-empty">
                     <i class="fas fa-inbox"></i>
-                    <h4>No Pending Subscription Records</h4>
-                    <p>There are no records matching your search or selected filters.</p>
+                    <h4>No Pending Subscriptions</h4>
+                    <p>There are currently no subscriptions awaiting administrator approval.</p>
                     <a href="<?= subEscape($resetUrl) ?>" class="subs-btn outline sm">
                         <i class="fas fa-rotate-left"></i>
                         Clear Filters
