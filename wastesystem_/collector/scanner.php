@@ -814,8 +814,8 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
             <table class="info-table">
                 <tr>
-                    <th>Resident ID</th>
-                    <td id="resident-id"></td>
+                      <th>House Address</th>
+                      <td id="resident-address"></td>
                 </tr>
                 <tr>
                     <th>Full Name</th>
@@ -996,7 +996,8 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
             residentId = data.resident_id;
 
-            document.getElementById("resident-id").textContent = data.resident_id;
+            document.getElementById("resident-address").textContent =
+            data.house_address || "No household address registered";
             document.getElementById("resident-name").textContent = data.fullname;
             document.getElementById("resident-username").textContent = data.username || "Not available";
             document.getElementById("household-id").textContent = data.household_id || "Not registered";
