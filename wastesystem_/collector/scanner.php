@@ -41,19 +41,21 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
     $action = $_POST["action"] ?? "";
 
-    // Verify resident QR code
+    // =====================================================
+    // VERIFY RESIDENT QR CODE
+    // Payment status is based ONLY on subscription_approval_history
+    // =====================================================
+
     if ($action === "verify") {
 
         $qr_data = trim($_POST["qr_data"] ?? "");
 
-        // Accept QR codes such as RESIDENT - 2 or RESIDENT-2
         if (!preg_match('/^RESIDENT\s*-\s*([1-9][0-9]*)$/i', $qr_data, $matches)) {
             respond(false, "Invalid resident QR code.");
         }
 
         $resident_id = (int) $matches[1];
 
-        // Get resident information
         $stmt = mysqli_prepare($conn, "
             SELECT
                 u.id,
@@ -61,76 +63,106 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 u.users,
                 h.id AS household_id,
                 h.house_address,
-                s.subscription_status,
-                s.payment_status,
-                s.total_amount,
-                s.amount_paid,
-                s.balance_due
+
+                sah.id AS approval_history_id,
+                sah.action_status,
+                sah.approved_at,
+                sah.total_amount,
+                sah.amount_paid,
+                sah.balance_due
+
             FROM users u
-            LEFT JOIN households h ON h.user_id = u.id
-            LEFT JOIN subscriptions s ON s.user_id = u.id
+
+            LEFT JOIN households h
+                ON h.user_id = u.id
+
+            LEFT JOIN subscriptions s
+                ON s.user_id = u.id
+
+            LEFT JOIN subscription_approval_history sah
+                ON sah.id = (
+                    SELECT MAX(sah2.id)
+                    FROM subscription_approval_history sah2
+                    WHERE sah2.subscription_id = s.id
+                )
+
             WHERE u.id = ?
               AND u.role = 'residents'
+
             LIMIT 1
-            ");
+        ");
 
-            if (!$stmt) {
-                respond(false, "Database error while checking resident: " . mysqli_error($conn));
-            }
-
-            mysqli_stmt_bind_param($stmt, "i", $resident_id);
-            mysqli_stmt_execute($stmt);
-
-            $result = mysqli_stmt_get_result($stmt);
-            $resident = mysqli_fetch_assoc($result);
-
-            mysqli_stmt_close($stmt);
-
-            if (!$resident) {
-                respond(false, "Resident account not found.");
-            }
-
-        // Set default payment information
-        $payment_status = "UNPAID";
-        $payment_amount = "0.00";
-        $amount_paid = "0.00";
-        $balance_due = "0.00";
-        $paid_at = "No payment recorded";
-
-        if ($resident["payment_status"] !== null) {
-
-            $payment_status = strtoupper(
-                trim((string)$resident["payment_status"])
-            );
-
-            $payment_amount = number_format(
-                (float)$resident["total_amount"],
-                2
-            );
-
-            $amount_paid = number_format(
-                (float)$resident["amount_paid"],
-                2
-            );
-
-            $balance_due = number_format(
-                (float)$resident["balance_due"],
-                2
-            );
-
-            if ($payment_status === "PAID") {
-                $paid_at = "Payment recorded in subscription";
-            }
+        if (!$stmt) {
+            respond(false, "Database error while checking resident: " . mysqli_error($conn));
         }
 
-        // Check if the resident can proceed with collection
+        mysqli_stmt_bind_param($stmt, "i", $resident_id);
+        mysqli_stmt_execute($stmt);
+
+        $result = mysqli_stmt_get_result($stmt);
+        $resident = mysqli_fetch_assoc($result);
+
+        mysqli_stmt_close($stmt);
+
+        if (!$resident) {
+            respond(false, "Resident account not found.");
+        }
+
+        // Read the latest approval-history record
+        $action_status = strtoupper(
+            trim((string)($resident["action_status"] ?? ""))
+        );
+
+        $has_payment_record = !empty($resident["approval_history_id"]);
+
+        // APPROVED means PAID, based on your requirement
+        $payment_status = ($action_status === "APPROVED")
+            ? "PAID"
+            : "UNPAID";
+
+        // Get amounts directly from subscription_approval_history
+        $payment_amount = number_format(
+            (float)($resident["total_amount"] ?? 0),
+            2
+        );
+
+        $amount_paid = number_format(
+            (float)($resident["amount_paid"] ?? 0),
+            2
+        );
+
+        $balance_due = number_format(
+            (float)($resident["balance_due"] ?? 0),
+            2
+        );
+
+        // Display approval date when an approved record exists
+        $paid_at = "No payment recorded";
+
+        if ($payment_status === "PAID" && !empty($resident["approved_at"])) {
+            $paid_at = date(
+                "M d, Y h:i A",
+                strtotime($resident["approved_at"])
+            );
+        }
+
+        // Display subscription status using the history action
+        if ($action_status === "APPROVED") {
+            $subscription_status = "Active";
+        } elseif ($action_status === "REJECTED") {
+            $subscription_status = "Rejected";
+        } elseif (!empty($action_status)) {
+            $subscription_status = ucfirst(strtolower($action_status));
+        } else {
+            $subscription_status = "No approval record";
+        }
+
+        // Collection is allowed only when:
+        // 1. Resident has a registered household.
+        // 2. Latest approval-history action is Approved.
         $can_collect = (
             !empty($resident["household_id"]) &&
-            ($resident["subscription_status"] ?? "") === "Active" &&
-            $payment_status === "PAID" &&
-            $resident["balance_due"] !== null &&
-            is_numeric($resident["balance_due"]) &&
-            (float)$resident["balance_due"] <= 0
+            $payment_status === "PAID"
         );
 
         respond(true, "Resident QR code recognized successfully.", [
@@ -139,8 +171,9 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             "username" => $resident["users"],
             "household_id" => $resident["household_id"],
             "house_address" => $resident["house_address"] ?? "No household address registered",
-            "subscription_status" => $resident["subscription_status"] ?? "No subscription",
+            "subscription_status" => $subscription_status,
 
+            "has_payment_record" => $has_payment_record,
             "payment_status" => $payment_status,
             "payment_amount" => $payment_amount,
             "amount_paid" => $amount_paid,
@@ -151,10 +184,14 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         ]);
     }
 
-    // Record waste collection
+    // =====================================================
+    // RECORD WASTE COLLECTION
+    // Recheck approval history before saving
+    // =====================================================
+
     if ($action === "collect") {
 
-        $resident_id = (int) ($_POST["resident_id"] ?? 0);
+        $resident_id = (int)($_POST["resident_id"] ?? 0);
         $segregation = $_POST["segregation"] ?? "";
 
         if ($resident_id <= 0) {
@@ -172,27 +209,41 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         try {
 
-            // Recheck resident and subscription
+            // Recheck resident, household, and latest approval history.
+            // No subscriptions table is used here.
             $stmt = mysqli_prepare($conn, "
                 SELECT
                     u.id,
                     h.id AS household_id,
-                    s.subscription_status,
-                    s.payment_status,
-                    s.total_amount,
-                    s.amount_paid,
-                    s.balance_due
+                    sah.id AS approval_history_id,
+                    sah.action_status
+
                 FROM users u
-                INNER JOIN households h ON h.user_id = u.id
-                INNER JOIN subscriptions s ON s.user_id = u.id
+
+                INNER JOIN households h
+                    ON h.user_id = u.id
+
+                LEFT JOIN subscriptions s
+                    ON s.user_id = u.id
+
+                LEFT JOIN subscription_approval_history sah
+                    ON sah.id = (
+                        SELECT MAX(sah2.id)
+                        FROM subscription_approval_history sah2
+                        WHERE sah2.subscription_id = s.id
+                    )
+
                 WHERE u.id = ?
-                AND u.role = 'residents'
+                  AND u.role = 'residents'
+
                 LIMIT 1
                 FOR UPDATE
             ");
 
             if (!$stmt) {
-                throw new Exception("Unable to verify resident.");
+                throw new Exception(
+                    "Unable to verify resident: " . mysqli_error($conn)
+                );
             }
 
             mysqli_stmt_bind_param($stmt, "i", $resident_id);
@@ -203,22 +254,27 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
             mysqli_stmt_close($stmt);
 
+            if (!$resident) {
+                throw new Exception("Resident or registered household not found.");
+            }
+
+            $latest_action = strtoupper(
+                trim((string)($resident["action_status"] ?? ""))
+            );
+
             if (
-                !$resident ||
-                $resident["subscription_status"] !== "Active" ||
-                strtoupper(trim($resident["payment_status"])) !== "PAID" ||
-                $resident["balance_due"] === null ||
-                !is_numeric($resident["balance_due"]) ||
-                (float)$resident["balance_due"] > 0
+                empty($resident["household_id"]) ||
+                empty($resident["approval_history_id"]) ||
+                $latest_action !== "APPROVED"
             ) {
                 throw new Exception(
-                    "Resident subscription is inactive or has an outstanding balance. Collection is blocked."
+                    "Collection is blocked. The resident must have an approved subscription in the subscription approval history and a registered household."
                 );
             }
 
-            $household_id = (int) $resident["household_id"];
+            $household_id = (int)$resident["household_id"];
 
-            // Award 10 points only for proper segregation
+            // Award 5 points only for proper segregation
             $points = ($segregation === "Properly Segregated") ? 5 : 0;
 
             // Insert collection record
@@ -236,7 +292,9 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             ");
 
             if (!$stmt) {
-                throw new Exception("Unable to create collection record.");
+                throw new Exception(
+                    "Unable to create collection record: " . mysqli_error($conn)
+                );
             }
 
             mysqli_stmt_bind_param(
@@ -249,11 +307,16 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             );
 
             if (!mysqli_stmt_execute($stmt)) {
+
                 if (mysqli_stmt_errno($stmt) == 1062) {
-                    throw new Exception("This household has already been recorded as collected today.");
+                    throw new Exception(
+                        "This household has already been recorded as collected today."
+                    );
                 }
 
-                throw new Exception("Unable to save collection record.");
+                throw new Exception(
+                    "Unable to save collection record: " . mysqli_stmt_error($stmt)
+                );
             }
 
             $collection_id = mysqli_insert_id($conn);
@@ -275,7 +338,9 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 ");
 
                 if (!$stmt) {
-                    throw new Exception("Unable to award eco-points.");
+                    throw new Exception(
+                        "Unable to prepare eco-points record: " . mysqli_error($conn)
+                    );
                 }
 
                 mysqli_stmt_bind_param(
@@ -288,7 +353,9 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 );
 
                 if (!mysqli_stmt_execute($stmt)) {
-                    throw new Exception("Unable to save eco-points.");
+                    throw new Exception(
+                        "Unable to save eco-points: " . mysqli_stmt_error($stmt)
+                    );
                 }
 
                 mysqli_stmt_close($stmt);
@@ -305,6 +372,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             ]);
 
         } catch (Throwable $e) {
+
             mysqli_rollback($conn);
             respond(false, $e->getMessage());
         }
@@ -830,14 +898,12 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                     <td id="household-id"></td>
                 </tr>
                 <tr>
-                    <th>House Address</th>
-                    <td id="resident-address"></td>
-                </tr>
-                <tr>
                     <th>Subscription Status</th>
                     <td id="subscription-status"></td>
                 </tr>
             </table>
+
+            <div id="payment-information-section">
 
             <h4 class="section-title">Payment Information</h4>
 
@@ -860,6 +926,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                     Payment Record: <span id="payment-date">No payment recorded</span>
                 </p>
 
+            </div>
             </div>
 
             <div id="collection-section" style="display:none;">
@@ -997,14 +1064,19 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             residentId = data.resident_id;
 
             document.getElementById("resident-address").textContent =
-            data.house_address || "No household address registered";
+                data.house_address || "No household address registered";
+
             document.getElementById("resident-name").textContent = data.fullname;
             document.getElementById("resident-username").textContent = data.username || "Not available";
             document.getElementById("household-id").textContent = data.household_id || "Not registered";
-            document.getElementById("resident-address").textContent = data.house_address;
             document.getElementById("subscription-status").textContent = data.subscription_status;
 
             document.getElementById("payment-status").textContent = data.payment_status;
+
+            const paymentSection = document.getElementById("payment-information-section");
+
+            paymentSection.style.display =
+                data.has_payment_record ? "block" : "none";
 
             document.getElementById("payment-amount").textContent =
                 "₱" + data.payment_amount;
