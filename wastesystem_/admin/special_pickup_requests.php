@@ -4,7 +4,6 @@
 // Do not add another HTML, HEAD or BODY tag.
 
 require_once __DIR__ . "/../config/database.php";
-require_once __DIR__ . "/../config/send_email.php";
 
 $message = "";
 $message_class = "";
@@ -28,57 +27,20 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         $request_id = (int)($_POST["request_id"] ?? 0);
 
+        // ACCEPT OR DENY
+        if (isset($_POST["decision"])) {
 
-// ACCEPT OR DENY + EMAIL NOTIFICATION
-if (isset($_POST["decision"])) {
+            $decision = $_POST["decision"];
 
-    $decision = $_POST["decision"];
+            if (
+                $request_id > 0 &&
+                in_array($decision, ["approved", "rejected"], true)
+            ) {
 
-    if (
-        $request_id > 0 &&
-        in_array($decision, ["approved", "rejected"], true)
-    ) {
-
-        // GET REQUEST AND RESIDENT EMAIL
-        $lookup = $conn->prepare("
-            SELECT
-                cs.*,
-                u.fullname,
-                u.email,
-                u.email_verified
-            FROM collection_schedules cs
-            LEFT JOIN users u ON cs.user_id = u.id
-            WHERE cs.id = ?
-              AND cs.status = 'pending'
-            LIMIT 1
-        ");
-
-        if (!$lookup) {
-            $message = "Database error: " . $conn->error;
-            $message_class = "error";
-        } else {
-
-            $lookup->bind_param("i", $request_id);
-            $lookup->execute();
-
-            $result = $lookup->get_result();
-            $request = $result->fetch_assoc();
-
-            $lookup->close();
-
-            if (!$request) {
-
-                $message = "Request already reviewed or not found.";
-                $message_class = "warning";
-
-            } else {
-
-                // UPDATE REQUEST STATUS
                 $stmt = $conn->prepare("
                     UPDATE collection_schedules
                     SET status = ?
-                    WHERE id = ?
-                      AND status = 'pending'
+                    WHERE id = ? AND status = 'pending'
                 ");
 
                 if ($stmt) {
@@ -87,148 +49,16 @@ if (isset($_POST["decision"])) {
 
                     if ($stmt->execute() && $stmt->affected_rows > 0) {
 
-                        $status_text = ucfirst($decision);
-
                         $message = "Request successfully " .
-                            ($decision === "approved"
-                                ? "approved!"
-                                : "rejected!");
+                            ($decision === "approved" ? "accepted!" : "denied!");
 
                         $message_class = "success";
-
-                        // SEND EMAIL ONLY TO VERIFIED EMAIL ADDRESSES
-                        if (
-                            !empty($request["email"]) &&
-                            (int)$request["email_verified"] === 1
-                        ) {
-
-                            $resident_name = htmlspecialchars(
-                                $request["fullname"] ?? "Resident",
-                                ENT_QUOTES,
-                                "UTF-8"
-                            );
-
-                            $date = htmlspecialchars(
-                                $request["requested_date"] ?? "",
-                                ENT_QUOTES,
-                                "UTF-8"
-                            );
-
-                            $time = htmlspecialchars(
-                                $request["requested_time"] ?? "",
-                                ENT_QUOTES,
-                                "UTF-8"
-                            );
-
-                            $location = htmlspecialchars(
-                                $request["location_address"] ?? "",
-                                ENT_QUOTES,
-                                "UTF-8"
-                            );
-
-                            $reason = htmlspecialchars(
-                                $request["pickup_reason"] ?? "",
-                                ENT_QUOTES,
-                                "UTF-8"
-                            );
-
-                            if ($decision === "approved") {
-
-                                $subject = "Special Pickup Request Approved - EcoTrack";
-
-                                $heading = "Your Pickup Request Has Been Approved!";
-
-                                $status_message = "
-                                    Good news! Your special pickup request
-                                    has been approved by the EcoTrack administrator.
-                                ";
-
-                                $status_color = "#198754";
-
-                            } else {
-
-                                $subject = "Special Pickup Request Rejected - EcoTrack";
-
-                                $heading = "Your Pickup Request Has Been Rejected";
-
-                                $status_message = "
-                                    Unfortunately, your special pickup request
-                                    has been rejected by the EcoTrack administrator.
-                                    Please contact the administration if you need assistance.
-                                ";
-
-                                $status_color = "#dc3545";
-                            }
-
-                            $body = "
-                                <div style='font-family:Arial,sans-serif;
-                                            max-width:600px;
-                                            margin:auto;
-                                            padding:25px;
-                                            border:1px solid #e5e5e5;
-                                            border-radius:10px;'>
-
-                                    <h2 style='color:#198754;'>
-                                        EcoTrack
-                                    </h2>
-
-                                    <h3 style='color:{$status_color};'>
-                                        {$heading}
-                                    </h3>
-
-                                    <p>Hello {$resident_name},</p>
-
-                                    <p>{$status_message}</p>
-
-                                    <h4>Pickup Request Details</h4>
-
-                                    <p><strong>Date:</strong> {$date}</p>
-                                    <p><strong>Time:</strong> {$time}</p>
-                                    <p><strong>Location:</strong> {$location}</p>
-                                    <p><strong>Reason:</strong> {$reason}</p>
-
-                                    <p>
-                                        <strong>Status:</strong>
-                                        <span style='color:{$status_color};
-                                                     font-weight:bold;'>
-                                            {$status_text}
-                                        </span>
-                                    </p>
-
-                                    <hr>
-
-                                    <p style='color:#777;font-size:12px;'>
-                                        This is an automated notification
-                                        from the EcoTrack Waste Collection
-                                        Management System.
-                                    </p>
-
-                                </div>
-                            ";
-
-                            if (!sendEmail(
-                                $request["email"],
-                                $subject,
-                                $body
-                            )) {
-                                error_log(
-                                    "Pickup notification email failed for request ID: "
-                                    . $request_id
-                                );
-
-                                $message .= " However, the notification email could not be sent.";
-                                $message_class = "warning";
-                            }
-
-                        } else {
-
-                            $message .= " No notification was sent because the resident's email is not verified.";
-                        }
 
                     } else {
 
                         $message = "Request already reviewed or not found.";
                         $message_class = "warning";
+
                     }
 
                     $stmt->close();
@@ -237,17 +67,17 @@ if (isset($_POST["decision"])) {
 
                     $message = "Database error: " . $conn->error;
                     $message_class = "error";
+
                 }
+
+            } else {
+
+                $message = "Invalid request.";
+                $message_class = "error";
+
             }
+
         }
-
-    } else {
-
-        $message = "Invalid request.";
-        $message_class = "error";
-    }
-}
-
 
         // DELETE REQUEST
         elseif (isset($_POST["delete_request"])) {
@@ -577,14 +407,18 @@ $requests_result = $conn->query("
                             $badge_class = "pending";
 
                             if (
-                         $status === "approved" ||
-                         $status === "scheduled" ||
-                         $status === "completed"
-                        ) {
-                        $badge_class = "approved";
-                        } elseif ($status === "rejected") {
-    $badge_class = "rejected";
-}
+                                $status === "approved" ||
+                                $status === "scheduled"
+                            ) {
+
+                                $badge_class = "approved";
+
+                            } elseif ($status === "rejected") {
+
+                                $badge_class = "rejected";
+
+                            }
+
                         ?>
 
 
@@ -696,8 +530,8 @@ $requests_result = $conn->query("
                                             Already Reviewed
                                         </span>
 
-                                        <!-- DELETE: ONLY APPROVED OR REJECTED tsaka completed -->
-                                       <?php if (in_array($status, ["approved", "rejected", "completed"], true)): ?>
+                                        <!-- DELETE: ONLY APPROVED OR REJECTED -->
+                                        <?php if (in_array($status, ["approved", "rejected"], true)): ?>
 
                                             <form method="POST"
                                                 action="dashboard.php?page=special_pickup_requests"
