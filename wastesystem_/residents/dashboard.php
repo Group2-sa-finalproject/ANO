@@ -67,69 +67,62 @@
 
         $subscription = $subscription_sql->get_result()->fetch_assoc();
         $subscription_sql->close();
+  
+        // SUBSCRIPTION BILLING DEFAULT VALUES
 
-        // SUBSCRIPTION DEFAULT VALUES
-        $subscription_payment_status = $subscription['payment_status']
-            ?? 'No Subscription';
+        $subscription_payment_status = $subscription['payment_status'] ?? 'No Subscription';
+        $subscription_status = $subscription['subscription_status'] ?? 'Not Subscribed';
 
-        $subscription_status = $subscription['subscription_status']
-            ?? 'Not Subscribed';
+        $subscription_original_amount = 0;
+        $subscription_points_redeemed = 0;
+        $subscription_discount = 0;
+        $subscription_total_amount = 0;
+        $subscription_amount_paid = 0;
+        $subscription_balance_due = 0;
+        $subscription_date = null;
 
-        $subscription_amount_paid = (float) (
-            $subscription['amount_paid'] ?? 0
-        );
+        if ($subscription) {
 
-        $subscription_balance_due = (float) (
-            $subscription['balance_due'] ?? 0
-        );
-
-        $subscription_discount = (float) (
-            $subscription['discount_amount'] ?? 0
-        );
-
-        if (isset($subscription['total_amount'])) {
-            $subscription_total_amount = (float) $subscription['total_amount'];
-        } else {
-            $original_amount = (float) (
-                $subscription['original_amount'] ?? 0
+            // Original subscription amount before discounts
+            $subscription_original_amount = (float) (
+                $subscription['original_amount']
+                ?? (
+                    (float) ($subscription['service_fee'] ?? 150)
+                    * (int) ($subscription['months'] ?? 1)
+                )
             );
 
-            $subscription_total_amount = max(
-                0,
-                $original_amount - $subscription_discount
+            // Eco Points used
+            $subscription_points_redeemed = (int) (
+                $subscription['points_redeemed'] ?? 0
             );
-        }
 
-        $subscription_date = $subscription['created_at'] ?? null;
+            // Discount in pesos
+            $subscription_discount = (float) (
+                $subscription['discount_amount']
+                ?? $subscription_points_redeemed
+            );
 
-        $subscription_is_paid =
-            strtolower((string) $subscription_payment_status) === 'paid';
-
-        // FINAL SUBSCRIPTION DEFAULT VALUES
-        if (!$subscription) {
-            $subscription_payment_status = "No Subscription";
-            $subscription_total_amount = 0;
-            $subscription_amount_paid = 0;
-            $subscription_balance_due = 0;
-            $subscription_status = "Not Subscribed";
-            $subscription_date = null;
-        } else {
-            $subscription_payment_status = $subscription["payment_status"] ?? "Unpaid";
+            // Total amount after applying Eco Points discount
             $subscription_total_amount = (float) (
-                $subscription["total_amount"] ?? 0
+                $subscription['total_amount']
+                ?? max(0, $subscription_original_amount - $subscription_discount)
             );
+
+            // Amount already paid
             $subscription_amount_paid = (float) (
-                $subscription["amount_paid"] ?? 0
+                $subscription['amount_paid'] ?? 0
             );
-            $subscription_balance_due = (float) (
-                $subscription["balance_due"] ?? 0
+
+            // Calculate the remaining balance
+            $subscription_balance_due = max(
+                0,
+                $subscription_total_amount - $subscription_amount_paid
             );
-            $subscription_status = $subscription["subscription_status"] ?? "Pending";
-            $subscription_date = $subscription["created_at"] ?? null;
+
+            $subscription_date = $subscription['created_at'] ?? null;
         }
 
-        $subscription_is_paid =
-            strtolower((string) $subscription_payment_status) === "paid";
 
         // GET LATEST PAYMENT
         $payment_sql = $conn->prepare("
@@ -605,136 +598,147 @@ a { text-decoration:none; }
                             </p>
 
                             <div class="billing-columns">
-                                <section class="billing-panel">
-                            <hr>
+                                
+                            <section class="billing-panel">
 
-                            <h6 class="payment-section-title">
-                                <i class="fas fa-file-invoice-dollar me-2"></i>
-                                Subscription Billing
-                            </h6>
+                                <h6 class="payment-section-title">
+                                    <i class="fas fa-file-invoice-dollar me-2"></i>
+                                    Subscription Billing
+                                </h6>
 
-                            <p class="mb-2">
-                                Subscription Payment Status
-                            </p>
+                                <p class="mb-2">Subscription Payment Status</p>
 
-                            <?php if (!$subscription): ?>
-
-                                <span class="payment-status status-unpaid">
-                                    NO SUBSCRIPTION
+                                <span class="payment-status <?= e($subscription_payment_badge); ?>">
+                                    <?= e(strtoupper($subscription_payment_status)); ?>
                                 </span>
 
-                            <?php else: ?>
+                                <p class="mt-3 mb-1">Subscription Status</p>
 
-                                <span class="payment-status <?= $subscription_payment_badge; ?>">
+                                <span class="status-badge <?= e($subscription_status_badge); ?>">
+                                    <?= e($subscription_status); ?>
+                                </span>
 
-                                    <?php if ($subscription_is_paid): ?>
-                                        <i class="fas fa-check-circle me-1"></i>
+                                <?php if (!$subscription): ?>
+
+                                    <div class="warning-box mt-4">
+                                        <i class="fas fa-exclamation-circle me-2"></i>
+                                        You have not subscribed yet. Please visit the Subscription
+                                        page to register for waste collection services.
+                                    </div>
+
+                                <?php else: ?>
+
+                                    <hr class="my-4">
+
+                                    <h6 class="payment-section-title">
+                                        <i class="fas fa-receipt me-2"></i>
+                                        Subscription Cost Breakdown
+                                    </h6>
+
+                                    <div class="detail-row">
+                                        <span class="detail-label">Original Subscription Amount</span>
+                                        <span class="detail-value">
+                                            ₱<?= number_format($subscription_original_amount, 2); ?>
+                                        </span>
+                                    </div>
+
+                                    <div class="detail-row">
+                                        <span class="detail-label">Eco Points Used</span>
+                                        <span class="detail-value">
+                                            <?= number_format($subscription_points_redeemed); ?> points
+                                        </span>
+                                    </div>
+
+                                    <div class="detail-row">
+                                        <span class="detail-label">Eco Points Discount</span>
+                                        <span class="detail-value text-success">
+                                            - ₱<?= number_format($subscription_discount, 2); ?>
+                                        </span>
+                                    </div>
+
+                                    <div class="detail-row">
+                                        <span class="detail-label">
+                                            Total After Discount
+                                        </span>
+                                        <span class="detail-value">
+                                            ₱<?= number_format($subscription_total_amount, 2); ?>
+                                        </span>
+                                    </div>
+
+                                    <div class="detail-row">
+                                        <span class="detail-label">Amount Paid</span>
+                                        <span class="detail-value text-success">
+                                            ₱<?= number_format($subscription_amount_paid, 2); ?>
+                                        </span>
+                                    </div>
+
+                                    <hr class="my-3">
+
+                                    <p class="mb-1 fw-bold">
+                                        <?= $subscription_balance_due > 0
+                                            ? "Remaining Balance to Pay"
+                                            : "Remaining Balance"; ?>
+                                    </p>
+
+                                    <div class="payment-amount"
+                                        style="<?= $subscription_balance_due > 0
+                                            ? 'color:#b54735;'
+                                            : 'color:#17643b;'; ?>">
+
+                                        ₱<?= number_format($subscription_balance_due, 2); ?>
+
+                                    </div>
+
+                                    <?php if ($subscription_balance_due > 0): ?>
+
+                                        <div class="warning-box mt-3">
+                                            <i class="fas fa-exclamation-circle me-2"></i>
+                                            You still have an outstanding balance of
+                                            <strong>
+                                                ₱<?= number_format($subscription_balance_due, 2); ?>
+                                            </strong>.
+                                            Please complete your payment.
+                                        </div>
+
+                                    <?php else: ?>
+                                        <div class="info-box mt-3">
+                                            <i class="fas fa-check-circle me-2"></i>
+
+                                            <?php if ($subscription_is_paid): ?>
+
+                                                Your subscription payment is fully paid.
+
+                                            <?php else: ?>
+
+                                                No remaining amount to pay. Your Eco Points discount
+                                                covers the subscription balance. Your subscription
+                                                may still require administrator approval.
+
+                                            <?php endif; ?>
+                                        </div>
+
                                     <?php endif; ?>
 
-                                    <?= e(strtoupper($subscription_payment_status)); ?>
+                                    <div class="detail-row">
+                                        <span class="detail-label">Subscription Date</span>
+                                        <span class="detail-value">
+                                            <?= $subscription_date
+                                                ? e(date("F d, Y", strtotime($subscription_date)))
+                                                : "Not available"; ?>
+                                        </span>
+                                    </div>
 
-                                </span>
+                                <?php endif; ?>
 
-                            <?php endif; ?>
+                                <a href="subscription.php"
+                                class="btn btn-ecotrack w-100 mt-3">
 
+                                    <i class="fas fa-file-invoice-dollar me-2"></i>
+                                    View Subscription Details
 
-                            <p class="mt-3 mb-1">
-                                Subscription Status
-                            </p>
+                                </a>
 
-                            <span class="status-badge <?= $subscription_status_badge; ?>">
-                                <?= e($subscription_status); ?>
-                            </span>
-
-
-                            <p class="mt-3 mb-1">
-                                Subscription Amount
-                            </p>
-
-                            <div class="payment-amount">
-                                ₱<?= number_format((float) $subscription_total_amount, 2); ?>
-                            </div>
-
-
-                            <div class="detail-row">
-
-                                <span class="detail-label">
-                                    Amount Paid
-                                </span>
-
-                                <span class="detail-value text-success">
-                                    ₱<?= number_format((float) $subscription_amount_paid, 2); ?>
-                                </span>
-
-                            </div>
-
-
-                            <div class="detail-row">
-
-                                <span class="detail-label">
-                                    Remaining Balance
-                                </span>
-
-                                <span class="detail-value">
-                                    ₱<?= number_format((float) $subscription_balance_due, 2); ?>
-                                </span>
-
-                            </div>
-
-
-                            <div class="detail-row">
-
-                                <span class="detail-label">
-                                    Subscription Date
-                                </span>
-
-                                <span class="detail-value">
-
-                                    <?= $subscription_date
-                                        ? e(date("F d, Y", strtotime($subscription_date)))
-                                        : "No subscription yet"; ?>
-
-                                </span>
-
-                            </div>
-
-
-                            <?php if (!$subscription): ?>
-
-                                <div class="warning-box mt-3">
-                                    <i class="fas fa-exclamation-circle me-2"></i>
-                                    You have not subscribed yet.
-                                    Please visit the Subscription page to register.
-                                </div>
-
-                            <?php elseif (!$subscription_is_paid): ?>
-
-                                <div class="warning-box mt-3">
-                                    <i class="fas fa-clock me-2"></i>
-                                    Your subscription payment is not yet fully recorded.
-                                    Please visit the Subscription page for payment information.
-                                </div>
-
-                            <?php else: ?>
-
-                                <div class="info-box mt-3">
-                                    <i class="fas fa-check-circle me-2"></i>
-                                    Your subscription payment is recorded as paid.
-                                </div>
-
-                            <?php endif; ?>
-
-
-                            <a href="subscription.php"
-                            class="btn btn-ecotrack w-100 mt-2">
-
-                                <i class="fas fa-file-invoice-dollar me-2"></i>
-                                View Subscription Details
-
-                            </a>
-
-
-                                </section>
+                            </section>
                                 <section class="billing-panel">
                             <!-- LATEST PAYMENT -->
 
