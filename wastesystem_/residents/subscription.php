@@ -617,6 +617,18 @@ $balance_due = (float) (
 $subscription_status = $subscription['subscription_status'] ?? 'Not Registered';
 $payment_status = $subscription['payment_status'] ?? 'Unpaid';
 
+/*
+|--------------------------------------------------------------------------
+| SYNC DISPLAYED PAYMENT STATUS WITH SUBSCRIPTION STATUS
+|--------------------------------------------------------------------------
+*/
+
+if (strtolower(trim($subscription_status)) === 'active') {
+    $payment_status = 'Paid';
+    $is_paid = true;
+    $is_pending_payment = false;
+}
+
 ?>
 
 <!DOCTYPE html>
@@ -1831,8 +1843,13 @@ a {
 
                         if (stripos($subscription_status, 'pending') !== false) {
                             $subscription_badge = 'status-pending';
-                        } elseif (stripos($subscription_status, 'approved') !== false) {
+                        } elseif (
+                            stripos($subscription_status, 'active') !== false ||
+                            stripos($subscription_status, 'approved') !== false
+                        ) {
                             $subscription_badge = 'status-paid';
+                        } elseif (stripos($subscription_status, 'rejected') !== false) {
+                            $subscription_badge = 'status-unpaid';
                         }
                         ?>
 
@@ -2003,45 +2020,42 @@ a {
             <p class="card-description">
                 Review your current payment status. Payment confirmation will be handled by the administrator.
             </p>
+          
+        <?php if ($is_paid): ?>
 
+            <div class="alert alert-success">
+                <i class="fas fa-check-circle me-2"></i>
+                <strong>Payment Status: Paid</strong><br>
+                Your subscription has been approved and your payment has been confirmed.
+            </div>
 
-            <?php if ($is_paid): ?>
+        <?php elseif (strtolower($subscription_status) === 'rejected'): ?>
 
-                <div class="info-box">
+            <div class="alert alert-danger">
+                <i class="fas fa-times-circle me-2"></i>
+                <strong>Subscription Rejected</strong><br>
+                Your subscription application was rejected. Your payment remains unpaid.
+                Please contact the administrator for assistance.
+            </div>
 
-                    <i class="fas fa-check-circle me-2"></i>
+        <?php elseif ($is_pending_payment || strtolower($subscription_status) === 'pending approval'): ?>
 
-                    Your subscription payment has been marked as
-                    <strong>Paid</strong>.
+            <div class="alert alert-warning">
+                <i class="fas fa-clock me-2"></i>
+                <strong>Pending Approval</strong><br>
+                Your subscription is awaiting administrator approval. Your payment status is currently Unpaid.
+            </div>
 
-                </div>
+        <?php else: ?>
 
+            <div class="alert alert-warning">
+                <strong>Payment Status: Unpaid</strong><br>
+                Your payment is currently Unpaid.
+                Please coordinate payment with the authorized collection personnel.
+                The administrator will update your payment record after verification.
+            </div>
 
-            <?php elseif ($is_pending_payment): ?>
-
-                <div class="warning-box">
-
-                    <i class="fas fa-clock me-2"></i>
-
-                    Your payment is awaiting administrator confirmation. Please wait for the administrator to update your payment status.
-
-                </div>
-
-
-            <?php else: ?>
-
-                <div class="warning-box">
-
-                    <i class="fas fa-info-circle me-2"></i>
-
-                    Your payment is currently <strong>Unpaid</strong>.
-                    Please coordinate payment with the authorized collection personnel.
-                    The administrator will update your payment record after verification.
-
-                </div>
-
-            <?php endif; ?>
-
+        <?php endif; ?>
 
             <?php if ($latest_payment): ?>
 
