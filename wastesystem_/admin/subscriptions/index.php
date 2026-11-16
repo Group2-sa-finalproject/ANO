@@ -1,3 +1,4 @@
+
 <?php
 // =====================================================
 // MANAGE SUBSCRIPTIONS AND PAYMENTS
@@ -17,7 +18,6 @@ if (!isset($_SESSION['user_id']) || ($_SESSION['role'] ?? '') !== 'admin') {
 }
 
 if (!isset($conn) || !($conn instanceof mysqli)) {
-    error_log('Manage Subscriptions: Database connection unavailable.');
     exit('Database connection error. Please check config/database.php.');
 }
 
@@ -25,7 +25,6 @@ $conn->set_charset('utf8mb4');
 
 // =====================================================
 // HELPER FUNCTIONS
-// Unique names prevent conflicts with other dashboard modules.
 // =====================================================
 
 function subEscape($value): string
@@ -40,11 +39,9 @@ function subPeso($amount): string
 
 // =====================================================
 // DASHBOARD ROUTING PARAMETERS
-// Preserve the dashboard page/module parameter.
 // =====================================================
 
 $moduleAction = $_SERVER['PHP_SELF'];
-
 $routeParams = [];
 
 foreach ($_GET as $key => $value) {
@@ -81,26 +78,20 @@ $success_message = '';
 $error_message = '';
 
 // =====================================================
-// PROCESS PAYMENT CONFIRMATION / REJECTION
+// PROCESS CONFIRMATION AND REJECTION
 // =====================================================
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $posted_token = $_POST['csrf_token'] ?? '';
-
-    $subscription_id = filter_input(
-        INPUT_POST,
-        'subscription_id',
-        FILTER_VALIDATE_INT
-    );
-
+    $subscription_id = filter_input(INPUT_POST, 'subscription_id', FILTER_VALIDATE_INT);
     $action = $_POST['action'] ?? '';
 
     if (
         !is_string($posted_token) ||
         !hash_equals($_SESSION['subscription_admin_csrf'], $posted_token)
     ) {
-        $error_message = 'Your session token is invalid. Please refresh the page and try again.';
+        $error_message = 'Your session token is invalid. Please refresh the page.';
 
     } elseif (!$subscription_id || $subscription_id < 1) {
 
@@ -116,7 +107,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $conn->begin_transaction();
 
-            // Lock subscription record before changing payment status.
+            // LOCK THE SUBSCRIPTION RECORD
             $lock_stmt = $conn->prepare("
                 SELECT
                     id,
@@ -130,37 +121,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ");
 
             if (!$lock_stmt) {
-                throw new Exception('Unable to prepare the subscription lookup.');
+                throw new Exception('Unable to prepare subscription lookup.');
             }
 
             $lock_stmt->bind_param('i', $subscription_id);
 
             if (!$lock_stmt->execute()) {
-                throw new Exception('Unable to retrieve the subscription record.');
+                throw new Exception('Unable to retrieve subscription.');
             }
 
             $subscription = $lock_stmt->get_result()->fetch_assoc();
-
             $lock_stmt->close();
 
             if (!$subscription) {
                 throw new Exception('Subscription record was not found.');
             }
 
-            if (
-                $subscription['payment_status'] !== 'Pending Confirmation' ||
-                $subscription['subscription_status'] !== 'Pending Approval'
-            ) {
-                throw new Exception(
-                    'This record is no longer awaiting payment confirmation. Please refresh the page.'
-                );
+            if ($subscription['subscription_status'] !== 'Pending Approval') {
+                throw new Exception('This subscription has already been processed. Please refresh the page.');
             }
 
+            $admin_id = (int)$_SESSION['user_id'];
+
             // =================================================
-            // CONFIRM PAYMENT
+            // CONFIRM PAYMENT NOTICE
             // =================================================
 
             if ($action === 'confirm') {
+
+                // Only confirm an actual submitted payment notice.
+                if ($subscription['payment_status'] !== 'Pending Confirmation') {
+                    throw new Exception(
+                        'This resident has not submitted a payment notice. Only Pending Confirmation records can be confirmed.'
+                    );
+                }
 
                 $update_stmt = $conn->prepare("
                     UPDATE subscriptions
@@ -175,43 +169,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ");
 
                 if (!$update_stmt) {
-                    throw new Exception('Unable to prepare the payment confirmation.');
+                    throw new Exception('Unable to prepare payment confirmation.');
                 }
 
                 $update_stmt->bind_param('i', $subscription_id);
 
                 if (!$update_stmt->execute()) {
-                    throw new Exception('Unable to update the subscription payment.');
+                    throw new Exception('Unable to confirm payment.');
                 }
 
-                $changed = $update_stmt->affected_rows;
+                if ($update_stmt->affected_rows !== 1) {
+                    $update_stmt->close();
+                    throw new Exception('Payment could not be confirmed. Please refresh the page.');
+                }
 
                 $update_stmt->close();
-
-                if ($changed !== 1) {
-                    throw new Exception(
-                        'The subscription could not be confirmed. Please refresh and try again.'
-                    );
-                }
 
                 // SAVE APPROVAL HISTORY
                 $history_stmt = $conn->prepare("
                     INSERT INTO subscription_approval_history
-                        (subscription_id, admin_id)
-                    VALUES (?, ?)
+                        (subscription_id, admin_id, action_status)
+                    VALUES (?, ?, 'Approved')
                 ");
 
                 if (!$history_stmt) {
                     throw new Exception('Unable to prepare approval history.');
                 }
 
-                $admin_id = (int)$_SESSION['user_id'];
-
-                $history_stmt->bind_param(
-                    'ii',
-                    $subscription_id,
-                    $admin_id
-                );
+                $history_stmt->bind_param('ii', $subscription_id, $admin_id);
 
                 if (!$history_stmt->execute()) {
                     throw new Exception('Unable to save approval history.');
@@ -220,49 +205,66 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $history_stmt->close();
 
                 $success_message =
-                    'Payment successfully confirmed. The subscription is now active and marked as paid.';
+                    'Payment notice successfully confirmed. The subscription is now Active and Paid.';
 
             } else {
 
                 // =================================================
-                // REJECT PAYMENT
+                // REJECT SUBSCRIPTION
                 // =================================================
 
                 $update_stmt = $conn->prepare("
                     UPDATE subscriptions
-                    SET payment_status = 'Unpaid'
+                    SET
+                        payment_status = 'Unpaid',
+                        subscription_status = 'Rejected'
                     WHERE id = ?
-                      AND payment_status = 'Pending Confirmation'
                       AND subscription_status = 'Pending Approval'
                 ");
 
                 if (!$update_stmt) {
-                    throw new Exception('Unable to prepare the payment rejection.');
+                    throw new Exception('Unable to prepare subscription rejection.');
                 }
 
                 $update_stmt->bind_param('i', $subscription_id);
 
                 if (!$update_stmt->execute()) {
-                    throw new Exception('Unable to update the payment status.');
+                    throw new Exception('Unable to reject subscription.');
                 }
 
-                $changed = $update_stmt->affected_rows;
+                if ($update_stmt->affected_rows !== 1) {
+                    $update_stmt->close();
+                    throw new Exception('Subscription could not be rejected. Please refresh the page.');
+                }
 
                 $update_stmt->close();
 
-                if ($changed !== 1) {
-                    throw new Exception(
-                        'The payment notice could not be rejected. Please refresh and try again.'
-                    );
+                // SAVE REJECTION HISTORY
+                $history_stmt = $conn->prepare("
+                    INSERT INTO subscription_approval_history
+                        (subscription_id, admin_id, action_status)
+                    VALUES (?, ?, 'Rejected')
+                ");
+
+                if (!$history_stmt) {
+                    throw new Exception('Unable to prepare rejection history.');
                 }
 
+                $history_stmt->bind_param('ii', $subscription_id, $admin_id);
+
+                if (!$history_stmt->execute()) {
+                    throw new Exception('Unable to save rejection history.');
+                }
+
+                $history_stmt->close();
+
                 $success_message =
-                    'Payment notice rejected. The subscription remains pending approval and unpaid.';
+                    'Subscription successfully rejected. It will no longer appear in pending records.';
             }
 
             $conn->commit();
 
-            // Generate a new token after successful action.
+            // NEW CSRF TOKEN
             $_SESSION['subscription_admin_csrf'] = bin2hex(random_bytes(32));
 
         } catch (Throwable $exception) {
@@ -277,7 +279,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 // =====================================================
-// RETRIEVE ALL SUBSCRIPTIONS
+// RETRIEVE PENDING AND UNPAID SUBSCRIPTIONS
 // =====================================================
 
 $list_sql = "
@@ -297,30 +299,25 @@ $list_sql = "
         s.subscription_status,
         s.payment_status,
         s.created_at
-
     FROM subscriptions AS s
-
-    INNER JOIN users AS u
-        ON u.id = s.user_id
-
-    ORDER BY
-        CASE
-            WHEN s.payment_status = 'Pending Confirmation' THEN 0
-            WHEN s.subscription_status = 'Pending Approval' THEN 1
-            ELSE 2
-        END,
-        s.created_at DESC
+    INNER JOIN users AS u ON u.id = s.user_id
+    WHERE
+        s.subscription_status <> 'Rejected'
+        AND (
+            s.subscription_status = 'Pending Approval'
+            OR s.payment_status <> 'Paid'
+        )
+    ORDER BY s.created_at DESC, s.id DESC
 ";
 
 $result = $conn->query($list_sql);
 
 if (!$result) {
-    error_log('Manage Subscriptions query failed: ' . $conn->error);
+    error_log('Subscription query failed: ' . $conn->error);
     exit('Unable to load subscription records.');
 }
 
 $all_rows = [];
-
 $total_records = 0;
 $pending_confirmations = 0;
 $active_subscriptions = 0;
@@ -403,13 +400,11 @@ if (!in_array($date_filter, $allowed_dates, true)) {
     $date_filter = 'all';
 }
 
-// Validate date format and actual calendar dates.
 function subValidDate(string $date): bool
 {
     $dateObj = DateTime::createFromFormat('!Y-m-d', $date);
 
-    return $dateObj &&
-        $dateObj->format('Y-m-d') === $date;
+    return $dateObj && $dateObj->format('Y-m-d') === $date;
 }
 
 if (!subValidDate($start_date)) {
@@ -435,7 +430,6 @@ $rows = array_values(array_filter(
         $end_date
     ) {
 
-        // SEARCH
         if ($search !== '') {
 
             $search_match =
@@ -448,7 +442,6 @@ $rows = array_values(array_filter(
             }
         }
 
-        // SUBSCRIPTION STATUS
         if (
             $subscription_filter !== 'all' &&
             $row['subscription_status'] !== $subscription_filter
@@ -456,7 +449,6 @@ $rows = array_values(array_filter(
             return false;
         }
 
-        // PAYMENT STATUS
         if (
             $payment_filter !== 'all' &&
             $row['payment_status'] !== $payment_filter
@@ -464,7 +456,6 @@ $rows = array_values(array_filter(
             return false;
         }
 
-        // DATE FILTER
         $created_date = date('Y-m-d', strtotime($row['created_at']));
 
         if ($date_filter === 'today') {
@@ -478,10 +469,7 @@ $rows = array_values(array_filter(
             $week_start = date('Y-m-d', strtotime('monday this week'));
             $week_end = date('Y-m-d', strtotime('sunday this week'));
 
-            if (
-                $created_date < $week_start ||
-                $created_date > $week_end
-            ) {
+            if ($created_date < $week_start || $created_date > $week_end) {
                 return false;
             }
 
@@ -518,13 +506,10 @@ $history_sql = "
         h.subscription_id,
         h.admin_id,
         h.approved_at,
+        h.action_status,
         admin.fullname AS admin_name
-
     FROM subscription_approval_history AS h
-
-    LEFT JOIN users AS admin
-        ON admin.id = h.admin_id
-
+    LEFT JOIN users AS admin ON admin.id = h.admin_id
     ORDER BY h.approved_at DESC
 ";
 
@@ -532,7 +517,7 @@ $history_result = $conn->query($history_sql);
 
 if (!$history_result) {
     error_log('Approval history query failed: ' . $conn->error);
-    exit('Unable to load approval history.');
+    exit('Unable to load approval history. Check that action_status exists in subscription_approval_history.');
 }
 
 $history_count = $history_result->num_rows;
@@ -540,41 +525,23 @@ $history_count = $history_result->num_rows;
 ?>
 
 <style>
-/* =====================================================
-   MANAGE SUBSCRIPTIONS - SELF-CONTAINED MODULE DESIGN
-   Does not depend on Bootstrap layout classes or
-   Bootstrap Icons. Uses Font Awesome from dashboard.php.
-   ===================================================== */
-
 .subs {
-    --subs-green: #198754;
-    --subs-green-dark: #146c43;
-    --subs-forest: #183d2b;
-    --subs-soft: #e8f4ec;
-    --subs-line: #e5ece7;
-    --subs-muted: #78877e;
-    --subs-ink: #263b30;
-
+    --green: #198754;
+    --dark: #146c43;
+    --forest: #183d2b;
+    --muted: #78877e;
+    --line: #e5ece7;
     width: 100%;
     min-width: 0;
-    color: var(--subs-ink);
+    color: #263b30;
     font-family: Arial, Helvetica, sans-serif;
     line-height: 1.5;
 }
 
-.subs,
-.subs * {
-    box-sizing: border-box;
-}
+.subs, .subs * { box-sizing: border-box; }
 
-.subs h2,
-.subs h3,
-.subs h4,
-.subs p {
-    margin: 0;
-}
+.subs h2, .subs h3, .subs h4, .subs p { margin: 0; }
 
-/* PAGE HEADER */
 .subs-header {
     display: flex;
     align-items: center;
@@ -584,94 +551,59 @@ $history_count = $history_result->num_rows;
     border-radius: 15px;
     padding: 26px 28px;
     margin-bottom: 20px;
-    box-shadow: 0 4px 15px rgba(25, 135, 84, .13);
 }
 
 .subs-header-icon {
     display: flex;
     align-items: center;
     justify-content: center;
-    flex-shrink: 0;
     width: 52px;
     height: 52px;
     border-radius: 14px;
-    background: rgba(255, 255, 255, .16);
+    background: rgba(255,255,255,.16);
     font-size: 22px;
 }
 
 .subs-title {
-    font-family: Arial, Helvetica, sans-serif;
     font-size: 26px;
     font-weight: 800;
-    line-height: 1.2;
-    letter-spacing: 0;
     color: #fff;
-    margin: 0 0 6px;
+    margin-bottom: 6px !important;
 }
 
 .subs-subtitle {
-    color: rgba(255, 255, 255, .86);
+    color: rgba(255,255,255,.86);
     font-size: 14px;
 }
 
-/* ALERTS */
 .subs-alert {
-    position: relative;
     display: flex;
     align-items: flex-start;
     gap: 11px;
-    padding: 14px 44px 14px 16px;
+    padding: 14px 16px;
     border-radius: 10px;
-    border: 1px solid transparent;
     margin-bottom: 16px;
     font-size: 13px;
-    line-height: 1.55;
-}
-
-.subs-alert > i {
-    margin-top: 3px;
-    flex-shrink: 0;
 }
 
 .subs-alert.success {
     background: #e9f7ef;
-    border-color: #ccebd8;
+    border: 1px solid #ccebd8;
     color: #1f6b41;
 }
 
 .subs-alert.danger {
     background: #fff0f0;
-    border-color: #f5d0d3;
+    border: 1px solid #f5d0d3;
     color: #a82d3a;
 }
 
 .subs-alert.warning {
     background: #fff8e4;
-    border-color: #f5e4b3;
+    border: 1px solid #f5e4b3;
     color: #7a5a0a;
 }
 
-.subs-alert-close {
-    position: absolute;
-    top: 10px;
-    right: 12px;
-    width: 26px;
-    height: 26px;
-    border: 0;
-    border-radius: 6px;
-    background: transparent;
-    color: inherit;
-    opacity: .6;
-    cursor: pointer;
-    font-size: 13px;
-}
-
-.subs-alert-close:hover {
-    opacity: 1;
-    background: rgba(0, 0, 0, .06);
-}
-
-/* SUMMARY CARDS */
 .subs-summary {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -688,69 +620,45 @@ $history_count = $history_result->num_rows;
     border: 1px solid #edf1ee;
     border-radius: 13px;
     padding: 20px 22px;
-    box-shadow: 0 3px 12px rgba(0, 0, 0, .04);
-    transition: .2s ease;
-}
-
-.subs-stat:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 6px 16px rgba(0, 0, 0, .07);
+    box-shadow: 0 3px 12px rgba(0,0,0,.04);
 }
 
 .subs-stat-label {
-    color: var(--subs-muted);
+    color: var(--muted);
     font-size: 12px;
     font-weight: 600;
     margin-bottom: 7px;
 }
 
 .subs-stat-value {
-    color: var(--subs-forest);
+    color: var(--forest);
     font-size: 28px;
     font-weight: 800;
     line-height: 1;
 }
 
-.subs-stat-value.warn {
-    color: #b78103;
-}
-
-.subs-stat-value.good {
-    color: #198754;
-}
+.subs-stat-value.warn { color: #b78103; }
+.subs-stat-value.good { color: #198754; }
 
 .subs-stat-icon {
     display: flex;
     align-items: center;
     justify-content: center;
-    flex-shrink: 0;
     width: 48px;
     height: 48px;
     border-radius: 12px;
     font-size: 20px;
 }
 
-.subs-stat-icon.green {
-    background: #e4f4eb;
-    color: #198754;
-}
+.subs-stat-icon.green { background: #e4f4eb; color: #198754; }
+.subs-stat-icon.yellow { background: #fff4d6; color: #b78103; }
+.subs-stat-icon.blue { background: #e5efff; color: #2764b5; }
 
-.subs-stat-icon.yellow {
-    background: #fff4d6;
-    color: #b78103;
-}
-
-.subs-stat-icon.blue {
-    background: #e5efff;
-    color: #2764b5;
-}
-
-/* MAIN CARD */
 .subs-card {
     background: #fff;
     border: 1px solid #edf1ee;
     border-radius: 14px;
-    box-shadow: 0 3px 14px rgba(0, 0, 0, .045);
+    box-shadow: 0 3px 14px rgba(0,0,0,.045);
     overflow: hidden;
 }
 
@@ -768,39 +676,33 @@ $history_count = $history_result->num_rows;
     display: flex;
     align-items: center;
     gap: 9px;
-    color: var(--subs-forest);
+    color: var(--forest);
     font-size: 17px;
     font-weight: 800;
-    margin-bottom: 4px;
+    margin-bottom: 4px !important;
 }
 
-.subs-card-title i {
-    color: var(--subs-green);
-}
+.subs-card-title i { color: var(--green); }
 
 .subs-card-caption {
-    color: var(--subs-muted);
+    color: var(--muted);
     font-size: 12px;
 }
 
-.subs-card-body {
-    padding: 24px;
-}
+.subs-card-body { padding: 24px; }
 
-/* BUTTONS */
 .subs-btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 7px;
-    min-height: 42px;
-    padding: 0 16px;
+    min-height: 40px;
+    padding: 0 14px;
     border: 1px solid transparent;
     border-radius: 8px;
     font-family: inherit;
     font-size: 12px;
     font-weight: 700;
-    line-height: 1;
     text-decoration: none;
     white-space: nowrap;
     cursor: pointer;
@@ -814,25 +716,24 @@ $history_count = $history_result->num_rows;
 }
 
 .subs-btn.primary {
-    background: var(--subs-green);
-    border-color: var(--subs-green);
+    background: var(--green);
+    border-color: var(--green);
     color: #fff;
 }
 
 .subs-btn.primary:hover {
-    background: var(--subs-green-dark);
-    border-color: var(--subs-green-dark);
+    background: var(--dark);
     color: #fff;
 }
 
 .subs-btn.outline {
     background: #fff;
-    border-color: var(--subs-green);
-    color: var(--subs-green);
+    border-color: var(--green);
+    color: var(--green);
 }
 
 .subs-btn.outline:hover {
-    background: var(--subs-green);
+    background: var(--green);
     color: #fff;
 }
 
@@ -840,11 +741,6 @@ $history_count = $history_result->num_rows;
     background: #fff;
     border-color: #d5dfd8;
     color: #5a6c61;
-}
-
-.subs-btn.neutral:hover {
-    background: #f1f5f2;
-    color: #2f4538;
 }
 
 .subs-btn.danger-outline {
@@ -860,22 +756,14 @@ $history_count = $history_result->num_rows;
 
 .subs-pill {
     display: inline-block;
-    min-width: 22px;
     padding: 3px 8px;
     border-radius: 20px;
     background: #e4f4eb;
     color: #146c43;
     font-size: 11px;
     font-weight: 700;
-    text-align: center;
 }
 
-.subs-btn.outline:hover .subs-pill {
-    background: rgba(255, 255, 255, .22);
-    color: #fff;
-}
-
-/* FILTER PANEL */
 .subs-filter {
     background: #f8fbf9;
     border: 1px solid #e1ece5;
@@ -895,23 +783,21 @@ $history_count = $history_result->num_rows;
     display: flex;
     align-items: center;
     justify-content: center;
-    flex-shrink: 0;
     width: 38px;
     height: 38px;
     border-radius: 10px;
     background: #e2f2e9;
-    color: var(--subs-green);
+    color: var(--green);
 }
 
 .subs-filter-title {
     color: #185c39;
     font-size: 15px;
     font-weight: 800;
-    margin-bottom: 2px;
 }
 
 .subs-filter-text {
-    color: var(--subs-muted);
+    color: var(--muted);
     font-size: 12px;
 }
 
@@ -922,13 +808,10 @@ $history_count = $history_result->num_rows;
     align-items: end;
 }
 
-.subs-field {
-    min-width: 0;
-}
-
+.subs-field { min-width: 0; }
 .subs-field.s4 { grid-column: span 4; }
-.subs-field.s3 { grid-column: span 3; }
 .subs-field.s2 { grid-column: span 2; }
+.subs-field.actions { grid-column: span 2; }
 
 .subs-label {
     display: block;
@@ -938,59 +821,37 @@ $history_count = $history_result->num_rows;
     font-weight: 700;
 }
 
-.subs-input,
-.subs-select {
+.subs-input, .subs-select {
     display: block;
     width: 100%;
     height: 42px;
     padding: 0 12px;
     border: 1px solid #dce7df;
     border-radius: 8px;
-    background-color: #fff;
-    color: var(--subs-ink);
+    background: #fff;
+    color: #263b30;
     font-family: inherit;
     font-size: 13px;
     outline: none;
-    transition: .15s ease;
 }
 
-.subs-select {
-    padding-right: 32px;
-    cursor: pointer;
+.subs-input:focus, .subs-select:focus {
+    border-color: var(--green);
+    box-shadow: 0 0 0 3px rgba(25,135,84,.12);
 }
 
-.subs-input:focus,
-.subs-select:focus {
-    border-color: var(--subs-green);
-    box-shadow: 0 0 0 3px rgba(25, 135, 84, .12);
-}
-
-.subs-search {
-    position: relative;
-}
-
+.subs-search { position: relative; }
 .subs-search i {
     position: absolute;
     left: 14px;
     top: 50%;
     transform: translateY(-50%);
-    color: var(--subs-green);
-    font-size: 13px;
-    pointer-events: none;
+    color: var(--green);
 }
+.subs-search .subs-input { padding-left: 38px; }
 
-.subs-search .subs-input {
-    padding-left: 38px;
-}
-
-.subs-filter-actions {
-    display: flex;
-    gap: 8px;
-}
-
-.subs-filter-actions .subs-btn.primary {
-    flex: 1;
-}
+.subs-filter-actions { display: flex; gap: 8px; }
+.subs-filter-actions .subs-btn.primary { flex: 1; }
 
 .subs-range {
     display: none;
@@ -1000,16 +861,10 @@ $history_count = $history_result->num_rows;
     border-radius: 10px;
     background: #fff;
 }
-
-.subs-range.open {
-    display: block;
-}
+.subs-range.open { display: block; }
 
 .subs-range-title {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: var(--subs-green);
+    color: var(--green);
     font-size: 13px;
     font-weight: 800;
     margin-bottom: 14px;
@@ -1022,14 +877,6 @@ $history_count = $history_result->num_rows;
     align-items: end;
 }
 
-.subs-range-note {
-    color: var(--subs-muted);
-    font-size: 12px;
-    line-height: 1.5;
-    padding-bottom: 12px;
-}
-
-/* TABLE HEADER ROW */
 .subs-table-top {
     display: flex;
     align-items: center;
@@ -1043,14 +890,12 @@ $history_count = $history_result->num_rows;
     display: flex;
     align-items: center;
     gap: 8px;
-    color: var(--subs-forest);
+    color: var(--forest);
     font-size: 14px;
     font-weight: 800;
 }
 
-.subs-table-title i {
-    color: var(--subs-green);
-}
+.subs-table-title i { color: var(--green); }
 
 .subs-count {
     display: inline-flex;
@@ -1064,11 +909,10 @@ $history_count = $history_result->num_rows;
     font-weight: 700;
 }
 
-/* TABLE */
 .subs-table-wrap {
     width: 100%;
     overflow-x: auto;
-    border: 1px solid var(--subs-line);
+    border: 1px solid var(--line);
     border-radius: 10px;
 }
 
@@ -1080,13 +924,12 @@ $history_count = $history_result->num_rows;
 }
 
 .subs-table th {
-    padding: 14px 14px;
+    padding: 14px;
     background: #f1f6f3;
     border-bottom: 1px solid #e0e9e3;
     color: #53665a;
     font-size: 11px;
     font-weight: 800;
-    letter-spacing: .3px;
     text-align: left;
     text-transform: uppercase;
     white-space: nowrap;
@@ -1099,17 +942,9 @@ $history_count = $history_result->num_rows;
     vertical-align: middle;
 }
 
-.subs-table tbody tr:last-child td {
-    border-bottom: 0;
-}
-
-.subs-table tbody tr:nth-child(even) {
-    background: #fafcfb;
-}
-
-.subs-table tbody tr:hover {
-    background: #f4faf6;
-}
+.subs-table tbody tr:last-child td { border-bottom: 0; }
+.subs-table tbody tr:nth-child(even) { background: #fafcfb; }
+.subs-table tbody tr:hover { background: #f4faf6; }
 
 .subs-name {
     color: #234b34;
@@ -1124,14 +959,8 @@ $history_count = $history_result->num_rows;
     font-size: 11px;
 }
 
-.subs-strong {
-    color: #234b34;
-    font-weight: 700;
-}
-
-.subs-nowrap {
-    white-space: nowrap;
-}
+.subs-strong { color: #234b34; font-weight: 700; }
+.subs-nowrap { white-space: nowrap; }
 
 .subs-badge {
     display: inline-block;
@@ -1142,25 +971,10 @@ $history_count = $history_result->num_rows;
     white-space: nowrap;
 }
 
-.subs-badge.green {
-    background: #dff3e5;
-    color: #1d6e42;
-}
-
-.subs-badge.yellow {
-    background: #fff1d6;
-    color: #8a5d0a;
-}
-
-.subs-badge.red {
-    background: #fde7e7;
-    color: #a43e3e;
-}
-
-.subs-badge.gray {
-    background: #eceff0;
-    color: #5f6b66;
-}
+.subs-badge.green { background: #dff3e5; color: #1d6e42; }
+.subs-badge.yellow { background: #fff1d6; color: #8a5d0a; }
+.subs-badge.red { background: #fde7e7; color: #a43e3e; }
+.subs-badge.gray { background: #eceff0; color: #5f6b66; }
 
 .subs-actions {
     display: flex;
@@ -1169,9 +983,7 @@ $history_count = $history_result->num_rows;
     gap: 6px;
 }
 
-.subs-actions form {
-    margin: 0;
-}
+.subs-actions form { margin: 0; }
 
 .subs-done {
     color: #1d6e42;
@@ -1181,10 +993,9 @@ $history_count = $history_result->num_rows;
 
 .subs-none {
     color: #87948a;
-    font-size: 12px;
+    font-size: 11px;
 }
 
-/* EMPTY STATE */
 .subs-empty {
     text-align: center;
     padding: 46px 20px;
@@ -1211,6 +1022,7 @@ $history_count = $history_result->num_rows;
 }
 
 /* HISTORY MODAL */
+
 .subs-modal {
     position: fixed;
     inset: 0;
@@ -1219,12 +1031,10 @@ $history_count = $history_result->num_rows;
     align-items: center;
     justify-content: center;
     padding: 20px;
-    background: rgba(15, 35, 25, .55);
+    background: rgba(15,35,25,.55);
 }
 
-.subs-modal.open {
-    display: flex;
-}
+.subs-modal.open { display: flex; }
 
 .subs-modal-dialog {
     display: flex;
@@ -1235,7 +1045,7 @@ $history_count = $history_result->num_rows;
     border-radius: 15px;
     background: #fff;
     overflow: hidden;
-    box-shadow: 0 20px 50px rgba(0, 0, 0, .3);
+    box-shadow: 0 20px 50px rgba(0,0,0,.3);
 }
 
 .subs-modal-head {
@@ -1249,33 +1059,24 @@ $history_count = $history_result->num_rows;
 }
 
 .subs-modal-title {
-    display: flex;
-    align-items: center;
-    gap: 9px;
     font-size: 18px;
     font-weight: 800;
-    margin-bottom: 4px;
+    margin-bottom: 4px !important;
 }
 
 .subs-modal-caption {
-    color: rgba(255, 255, 255, .75);
+    color: rgba(255,255,255,.75);
     font-size: 12px;
 }
 
 .subs-modal-close {
-    flex-shrink: 0;
     width: 34px;
     height: 34px;
     border: 0;
     border-radius: 8px;
-    background: rgba(255, 255, 255, .16);
+    background: rgba(255,255,255,.16);
     color: #fff;
     cursor: pointer;
-    font-size: 15px;
-}
-
-.subs-modal-close:hover {
-    background: rgba(255, 255, 255, .28);
 }
 
 .subs-modal-body {
@@ -1289,7 +1090,7 @@ $history_count = $history_result->num_rows;
     display: flex;
     justify-content: flex-end;
     padding: 14px 24px;
-    border-top: 1px solid var(--subs-line);
+    border-top: 1px solid var(--line);
     background: #fff;
 }
 
@@ -1306,12 +1107,12 @@ $history_count = $history_result->num_rows;
 }
 
 .subs-history-intro > i {
-    color: var(--subs-green);
+    color: var(--green);
     font-size: 26px;
 }
 
 .subs-history-box {
-    border: 1px solid var(--subs-line);
+    border: 1px solid var(--line);
     border-radius: 10px;
     background: #fff;
     overflow: hidden;
@@ -1322,9 +1123,7 @@ $history_count = $history_result->num_rows;
     border-radius: 0;
 }
 
-.subs-history-box .subs-table {
-    min-width: 640px;
-}
+.subs-history-box .subs-table { min-width: 700px; }
 
 .subs-history-box .subs-table th {
     background: #e8f4ec;
@@ -1351,93 +1150,93 @@ $history_count = $history_result->num_rows;
     display: flex;
     align-items: center;
     justify-content: center;
-    flex-shrink: 0;
     width: 34px;
     height: 34px;
     border-radius: 50%;
     background: #e2f2e9;
-    color: var(--subs-green);
-    font-size: 13px;
+    color: var(--green);
 }
 
 .subs-date-icon {
     margin-right: 6px;
-    color: var(--subs-green);
+    color: var(--green);
 }
 
-/* RESPONSIVE */
+/* SUBSCRIPTION ACTION BUTTONS - MATCH COLLECTION ROUTES PAGE */
+.subscription-action-btn {
+    border: 0;
+    border-radius: 8px;
+    padding: 10px 14px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 750;
+    text-decoration: none;
+    cursor: pointer;
+    transition: .18s;
+    white-space: nowrap;
+}
+
+.subscription-action-btn:hover {
+    transform: translateY(-1px);
+    filter: brightness(.96);
+}
+
+.subscription-btn-approve {
+    background: #198754;
+    color: #fff;
+}
+
+.subscription-btn-approve:hover {
+    background: #146c43;
+    color: #fff;
+}
+
+.subscription-btn-reject {
+    background: #dc3545;
+    color: #fff;
+}
+
+.subscription-btn-reject:hover {
+    background: #bb2d3b;
+    color: #fff;
+}
+
+.subscription-action-group {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex-wrap: wrap;
+}
+
 @media (max-width: 1100px) {
     .subs-field.s4 { grid-column: span 12; }
-    .subs-field.s3 { grid-column: span 4; }
     .subs-field.s2 { grid-column: span 4; }
     .subs-field.actions { grid-column: span 12; }
 }
 
 @media (max-width: 800px) {
-    .subs-summary {
-        grid-template-columns: 1fr;
-    }
-
-    .subs-range-grid {
-        grid-template-columns: 1fr;
-    }
-
-    .subs-range-note {
-        padding-bottom: 0;
-    }
-
-    .subs-card-header,
-    .subs-card-body {
-        padding: 16px;
-    }
-
-    .subs-filter {
-        padding: 16px;
-    }
+    .subs-summary { grid-template-columns: 1fr; }
+    .subs-range-grid { grid-template-columns: 1fr; }
+    .subs-card-header, .subs-card-body { padding: 16px; }
+    .subs-filter { padding: 16px; }
 }
 
 @media (max-width: 640px) {
-    .subs-header {
-        padding: 20px;
-    }
-
-    .subs-header-icon {
-        display: none;
-    }
-
-    .subs-title {
-        font-size: 21px;
-    }
-
-    .subs-field.s3,
-    .subs-field.s2 {
-        grid-column: span 12;
-    }
-
-    .subs-modal {
-        padding: 10px;
-    }
-
-    .subs-modal-body {
-        padding: 16px;
-    }
-}
-
-@media print {
-    .subs-filter,
-    .subs-no-print {
-        display: none !important;
-    }
-
-    .subs-card,
-    .subs-stat {
-        box-shadow: none;
-    }
+    .subs-header { padding: 20px; }
+    .subs-header-icon { display: none; }
+    .subs-title { font-size: 21px; }
+    .subs-field.s2 { grid-column: span 12; }
+    .subs-modal { padding: 10px; }
+    .subs-modal-body { padding: 16px; }
 }
 </style>
 
 <div class="subs">
 
+    <!-- PAGE HEADER -->
     <div class="subs-header">
 
         <div class="subs-header-icon">
@@ -1446,7 +1245,6 @@ $history_count = $history_result->num_rows;
 
         <div>
             <h2 class="subs-title">Manage Subscriptions and Payments</h2>
-
             <p class="subs-subtitle">
                 Review resident subscriptions, verify payment notices, and manage payment records.
             </p>
@@ -1454,28 +1252,20 @@ $history_count = $history_result->num_rows;
 
     </div>
 
+    <!-- SUCCESS MESSAGE -->
     <?php if ($success_message !== ''): ?>
-
         <div class="subs-alert success" role="status">
             <i class="fas fa-circle-check"></i>
             <div><?= subEscape($success_message) ?></div>
-            <button type="button" class="subs-alert-close" data-subs-dismiss aria-label="Close">
-                <i class="fas fa-xmark"></i>
-            </button>
         </div>
-
     <?php endif; ?>
 
+    <!-- ERROR MESSAGE -->
     <?php if ($error_message !== ''): ?>
-
         <div class="subs-alert danger" role="alert">
             <i class="fas fa-triangle-exclamation"></i>
             <div><?= subEscape($error_message) ?></div>
-            <button type="button" class="subs-alert-close" data-subs-dismiss aria-label="Close">
-                <i class="fas fa-xmark"></i>
-            </button>
         </div>
-
     <?php endif; ?>
 
     <div class="subs-alert warning">
@@ -1488,14 +1278,14 @@ $history_count = $history_result->num_rows;
         </div>
     </div>
 
+    <!-- SUMMARY CARDS -->
     <div class="subs-summary">
 
         <div class="subs-stat">
             <div>
-                <div class="subs-stat-label">All Subscription Records</div>
+                <div class="subs-stat-label">Pending / Unpaid Records</div>
                 <div class="subs-stat-value"><?= number_format($total_records) ?></div>
             </div>
-
             <div class="subs-stat-icon green">
                 <i class="fas fa-users"></i>
             </div>
@@ -1506,7 +1296,6 @@ $history_count = $history_result->num_rows;
                 <div class="subs-stat-label">Awaiting Payment Confirmation</div>
                 <div class="subs-stat-value warn"><?= number_format($pending_confirmations) ?></div>
             </div>
-
             <div class="subs-stat-icon yellow">
                 <i class="fas fa-hourglass-half"></i>
             </div>
@@ -1517,7 +1306,6 @@ $history_count = $history_result->num_rows;
                 <div class="subs-stat-label">Active and Paid Subscriptions</div>
                 <div class="subs-stat-value good"><?= number_format($active_subscriptions) ?></div>
             </div>
-
             <div class="subs-stat-icon blue">
                 <i class="fas fa-circle-check"></i>
             </div>
@@ -1525,6 +1313,7 @@ $history_count = $history_result->num_rows;
 
     </div>
 
+    <!-- SUBSCRIPTION RECORDS -->
     <div class="subs-card">
 
         <div class="subs-card-header">
@@ -1536,7 +1325,7 @@ $history_count = $history_result->num_rows;
                 </h3>
 
                 <p class="subs-card-caption">
-                    View and manage all resident subscription payments.
+                    Review subscriptions that are pending approval or have unpaid balances.
                 </p>
             </div>
 
@@ -1550,45 +1339,39 @@ $history_count = $history_result->num_rows;
 
         <div class="subs-card-body">
 
+            <!-- FILTERS -->
             <div class="subs-filter">
 
                 <div class="subs-filter-head">
-
                     <div class="subs-filter-icon">
                         <i class="fas fa-filter"></i>
                     </div>
 
                     <div>
                         <h4 class="subs-filter-title">Search and Filter</h4>
-
                         <p class="subs-filter-text">
-                            Find specific subscription records using resident details, payment status, or date created.
+                            Find specific subscription records using resident details, status, or date.
                         </p>
                     </div>
-
                 </div>
 
                 <form method="GET" action="<?= subEscape($moduleAction) ?>">
 
                     <?php foreach ($routeParams as $key => $value): ?>
-
                         <input
                             type="hidden"
                             name="<?= subEscape($key) ?>"
                             value="<?= subEscape($value) ?>"
                         >
-
                     <?php endforeach; ?>
 
                     <div class="subs-filter-grid">
 
                         <div class="subs-field s4">
-
                             <label class="subs-label" for="subsSearch">Search Resident</label>
 
                             <div class="subs-search">
                                 <i class="fas fa-magnifying-glass"></i>
-
                                 <input
                                     type="text"
                                     id="subsSearch"
@@ -1598,111 +1381,52 @@ $history_count = $history_result->num_rows;
                                     value="<?= subEscape($search) ?>"
                                 >
                             </div>
-
                         </div>
 
                         <div class="subs-field s2">
-
                             <label class="subs-label" for="subsSubStatus">Subscription Status</label>
 
                             <select id="subsSubStatus" name="subscription_status" class="subs-select">
-
-                                <option value="all" <?= $subscription_filter === 'all' ? 'selected' : '' ?>>
-                                    All Status
-                                </option>
-
-                                <option value="Pending Approval" <?= $subscription_filter === 'Pending Approval' ? 'selected' : '' ?>>
-                                    Pending Approval
-                                </option>
-
-                                <option value="Active" <?= $subscription_filter === 'Active' ? 'selected' : '' ?>>
-                                    Active
-                                </option>
-
+                                <option value="all" <?= $subscription_filter === 'all' ? 'selected' : '' ?>>All Status</option>
+                                <option value="Pending Approval" <?= $subscription_filter === 'Pending Approval' ? 'selected' : '' ?>>Pending Approval</option>
+                                <option value="Active" <?= $subscription_filter === 'Active' ? 'selected' : '' ?>>Active</option>
                             </select>
-
                         </div>
 
                         <div class="subs-field s2">
-
                             <label class="subs-label" for="subsPayStatus">Payment Status</label>
 
                             <select id="subsPayStatus" name="payment_status" class="subs-select">
-
-                                <option value="all" <?= $payment_filter === 'all' ? 'selected' : '' ?>>
-                                    All Payments
-                                </option>
-
-                                <option value="Pending Confirmation" <?= $payment_filter === 'Pending Confirmation' ? 'selected' : '' ?>>
-                                    Pending Confirmation
-                                </option>
-
-                                <option value="Paid" <?= $payment_filter === 'Paid' ? 'selected' : '' ?>>
-                                    Paid
-                                </option>
-
-                                <option value="Unpaid" <?= $payment_filter === 'Unpaid' ? 'selected' : '' ?>>
-                                    Unpaid
-                                </option>
-
+                                <option value="all" <?= $payment_filter === 'all' ? 'selected' : '' ?>>All Payments</option>
+                                <option value="Pending Confirmation" <?= $payment_filter === 'Pending Confirmation' ? 'selected' : '' ?>>Pending Confirmation</option>
+                                <option value="Paid" <?= $payment_filter === 'Paid' ? 'selected' : '' ?>>Paid</option>
+                                <option value="Unpaid" <?= $payment_filter === 'Unpaid' ? 'selected' : '' ?>>Unpaid</option>
                             </select>
-
                         </div>
 
                         <div class="subs-field s2">
-
                             <label class="subs-label" for="subscriptionDateFilter">Date Created</label>
 
-                            <select
-                                id="subscriptionDateFilter"
-                                name="date_filter"
-                                class="subs-select"
-                            >
-
-                                <option value="all" <?= $date_filter === 'all' ? 'selected' : '' ?>>
-                                    All Dates
-                                </option>
-
-                                <option value="today" <?= $date_filter === 'today' ? 'selected' : '' ?>>
-                                    Today
-                                </option>
-
-                                <option value="week" <?= $date_filter === 'week' ? 'selected' : '' ?>>
-                                    This Week
-                                </option>
-
-                                <option value="month" <?= $date_filter === 'month' ? 'selected' : '' ?>>
-                                    This Month
-                                </option>
-
-                                <option value="custom" <?= $date_filter === 'custom' ? 'selected' : '' ?>>
-                                    Custom Range
-                                </option>
-
+                            <select id="subscriptionDateFilter" name="date_filter" class="subs-select">
+                                <option value="all" <?= $date_filter === 'all' ? 'selected' : '' ?>>All Dates</option>
+                                <option value="today" <?= $date_filter === 'today' ? 'selected' : '' ?>>Today</option>
+                                <option value="week" <?= $date_filter === 'week' ? 'selected' : '' ?>>This Week</option>
+                                <option value="month" <?= $date_filter === 'month' ? 'selected' : '' ?>>This Month</option>
+                                <option value="custom" <?= $date_filter === 'custom' ? 'selected' : '' ?>>Custom Range</option>
                             </select>
-
                         </div>
 
-                        <div class="subs-field s2 actions">
-
+                        <div class="subs-field actions">
                             <div class="subs-filter-actions">
-
                                 <button type="submit" class="subs-btn primary">
                                     <i class="fas fa-magnifying-glass"></i>
                                     Apply
                                 </button>
 
-                                <a
-                                    href="<?= subEscape($resetUrl) ?>"
-                                    class="subs-btn neutral"
-                                    title="Reset Filters"
-                                    aria-label="Reset Filters"
-                                >
+                                <a href="<?= subEscape($resetUrl) ?>" class="subs-btn neutral" title="Reset Filters">
                                     <i class="fas fa-rotate-left"></i>
                                 </a>
-
                             </div>
-
                         </div>
 
                     </div>
@@ -1711,7 +1435,6 @@ $history_count = $history_result->num_rows;
                         id="subscriptionCustomDate"
                         class="subs-range <?= $date_filter === 'custom' ? 'open' : '' ?>"
                     >
-
                         <div class="subs-range-title">
                             <i class="fas fa-calendar-days"></i>
                             Custom Date Range
@@ -1720,9 +1443,7 @@ $history_count = $history_result->num_rows;
                         <div class="subs-range-grid">
 
                             <div class="subs-field">
-
                                 <label class="subs-label" for="subsStart">Start Date</label>
-
                                 <input
                                     type="date"
                                     id="subsStart"
@@ -1730,13 +1451,10 @@ $history_count = $history_result->num_rows;
                                     class="subs-input"
                                     value="<?= subEscape($start_date) ?>"
                                 >
-
                             </div>
 
                             <div class="subs-field">
-
                                 <label class="subs-label" for="subsEnd">End Date</label>
-
                                 <input
                                     type="date"
                                     id="subsEnd"
@@ -1744,22 +1462,20 @@ $history_count = $history_result->num_rows;
                                     class="subs-input"
                                     value="<?= subEscape($end_date) ?>"
                                 >
-
                             </div>
 
-                            <p class="subs-range-note">
-                                <i class="fas fa-circle-info"></i>
+                            <p class="subs-filter-text">
                                 You may leave either date blank if that boundary is not needed.
                             </p>
 
                         </div>
-
                     </div>
 
                 </form>
 
             </div>
 
+            <!-- TABLE INFORMATION -->
             <div class="subs-table-top">
 
                 <div class="subs-table-title">
@@ -1778,18 +1494,13 @@ $history_count = $history_result->num_rows;
             <?php if (empty($rows)): ?>
 
                 <div class="subs-empty">
-
-                    <i class="fas fa-magnifying-glass"></i>
-
-                    <h4>No Subscription Records Found</h4>
-
-                    <p>No records matched your search or selected filters.</p>
-
+                    <i class="fas fa-inbox"></i>
+                    <h4>No Pending Subscription Records</h4>
+                    <p>There are no records matching your search or selected filters.</p>
                     <a href="<?= subEscape($resetUrl) ?>" class="subs-btn outline sm">
                         <i class="fas fa-rotate-left"></i>
                         Clear Filters
                     </a>
-
                 </div>
 
             <?php else: ?>
@@ -1799,7 +1510,6 @@ $history_count = $history_result->num_rows;
                     <table class="subs-table">
 
                         <thead>
-
                             <tr>
                                 <th>Resident</th>
                                 <th>Subscription</th>
@@ -1812,7 +1522,6 @@ $history_count = $history_result->num_rows;
                                 <th>Date Created</th>
                                 <th style="min-width:190px;">Administrator Action</th>
                             </tr>
-
                         </thead>
 
                         <tbody>
@@ -1820,7 +1529,6 @@ $history_count = $history_result->num_rows;
                         <?php foreach ($rows as $row): ?>
 
                             <?php
-
                             $payment_status = $row['payment_status'];
                             $subscription_status = $row['subscription_status'];
 
@@ -1837,14 +1545,12 @@ $history_count = $history_result->num_rows;
                             $subscription_badge = $subscription_status === 'Active'
                                 ? 'green'
                                 : 'gray';
-
                             ?>
 
                             <tr>
 
                                 <td>
                                     <div class="subs-name"><?= subEscape($row['fullname']) ?></div>
-
                                     <span class="subs-sub">
                                         @<?= subEscape($row['username']) ?>
                                         · ID <?= (int)$row['user_id'] ?>
@@ -1852,8 +1558,9 @@ $history_count = $history_result->num_rows;
                                 </td>
 
                                 <td>
-                                    <span class="subs-strong"><?= (int)$row['months'] ?> month(s)</span>
-
+                                    <span class="subs-strong">
+                                        <?= (int)$row['months'] ?> month(s)
+                                    </span>
                                     <span class="subs-sub">
                                         Fee: <?= subPeso($row['service_fee']) ?>
                                     </span>
@@ -1861,7 +1568,6 @@ $history_count = $history_result->num_rows;
 
                                 <td>
                                     <?= number_format((int)$row['points_redeemed']) ?> point(s)
-
                                     <span class="subs-sub">
                                         Discount: <?= subPeso($row['discount_amount']) ?>
                                     </span>
@@ -1891,9 +1597,7 @@ $history_count = $history_result->num_rows;
                                     </span>
 
                                     <?php if ($payment_status === 'Pending Confirmation'): ?>
-
                                         <span class="subs-sub">Cash Simulation</span>
-
                                     <?php endif; ?>
                                 </td>
 
@@ -1901,107 +1605,71 @@ $history_count = $history_result->num_rows;
                                     <?= subEscape(date('M d, Y', strtotime($row['created_at']))) ?>
                                 </td>
 
+                                <!-- ADMINISTRATOR ACTION -->
                                 <td>
-
                                     <?php if (
-                                        $payment_status === 'Pending Confirmation' &&
-                                        $subscription_status === 'Pending Approval'
+                                        $subscription_status === 'Pending Approval' &&
+                                        $payment_status !== 'Paid'
                                     ): ?>
 
-                                        <div class="subs-actions">
+                                        <div class="subscription-action-group">
 
-                                            <form
-                                                method="POST"
-                                                action="<?= subEscape($moduleAction) ?>"
-                                                onsubmit="return confirm('Confirm this simulated cash payment and activate the subscription?');"
-                                            >
+                                            <!-- APPROVE BUTTON -->
+                                            <form method="POST"
+                                                action=""
+                                                onsubmit="return confirm('Are you sure you want to approve this subscription?');">
 
-                                                <?php foreach ($routeParams as $key => $value): ?>
-
-                                                    <input
-                                                        type="hidden"
-                                                        name="<?= subEscape($key) ?>"
-                                                        value="<?= subEscape($value) ?>"
-                                                    >
-
-                                                <?php endforeach; ?>
-
-                                                <input
-                                                    type="hidden"
+                                                <input type="hidden"
                                                     name="csrf_token"
-                                                    value="<?= subEscape($_SESSION['subscription_admin_csrf']) ?>"
-                                                >
+                                                    value="<?= htmlspecialchars($_SESSION['subscription_admin_csrf']) ?>">
 
-                                                <input
-                                                    type="hidden"
+                                                <input type="hidden"
                                                     name="subscription_id"
-                                                    value="<?= (int)$row['id'] ?>"
-                                                >
+                                                    value="<?= (int)$row['id'] ?>">
 
-                                                <input type="hidden" name="action" value="confirm">
+                                                <button type="submit"
+                                                        name="confirm"
+                                                        value="1"
+                                                        class="subscription-action-btn subscription-btn-approve">
 
-                                                <button type="submit" class="subs-btn primary sm">
-                                                    <i class="fas fa-circle-check"></i>
-                                                    Confirm
+                                                    <i class="fas fa-check-circle"></i>
+                                                    Approve
+
                                                 </button>
-
                                             </form>
 
-                                            <form
-                                                method="POST"
-                                                action="<?= subEscape($moduleAction) ?>"
-                                                onsubmit="return confirm('Reject this payment notice? Its payment status will return to Unpaid.');"
-                                            >
 
-                                                <?php foreach ($routeParams as $key => $value): ?>
+                                            <!-- REJECT BUTTON -->
+                                            <form method="POST"
+                                                action=""
+                                                onsubmit="return confirm('Are you sure you want to reject this subscription?');">
 
-                                                    <input
-                                                        type="hidden"
-                                                        name="<?= subEscape($key) ?>"
-                                                        value="<?= subEscape($value) ?>"
-                                                    >
-
-                                                <?php endforeach; ?>
-
-                                                <input
-                                                    type="hidden"
+                                                <input type="hidden"
                                                     name="csrf_token"
-                                                    value="<?= subEscape($_SESSION['subscription_admin_csrf']) ?>"
-                                                >
+                                                    value="<?= htmlspecialchars($_SESSION['subscription_admin_csrf']) ?>">
 
-                                                <input
-                                                    type="hidden"
+                                                <input type="hidden"
                                                     name="subscription_id"
-                                                    value="<?= (int)$row['id'] ?>"
-                                                >
+                                                    value="<?= (int)$row['id'] ?>">
 
-                                                <input type="hidden" name="action" value="reject">
+                                                <button type="submit"
+                                                        name="reject"
+                                                        value="1"
+                                                        class="subscription-action-btn subscription-btn-reject">
 
-                                                <button type="submit" class="subs-btn danger-outline sm">
-                                                    <i class="fas fa-circle-xmark"></i>
+                                                    <i class="fas fa-times-circle"></i>
                                                     Reject
-                                                </button>
 
+                                                </button>
                                             </form>
 
                                         </div>
 
-                                    <?php elseif (
-                                        $subscription_status === 'Active' &&
-                                        $payment_status === 'Paid'
-                                    ): ?>
-
-                                        <span class="subs-done">
-                                            <i class="fas fa-circle-check"></i>
-                                            Payment confirmed
-                                        </span>
-
                                     <?php else: ?>
 
-                                        <span class="subs-none">No action available</span>
+                                        <span class="text-muted">No actions available</span>
 
                                     <?php endif; ?>
-
                                 </td>
 
                             </tr>
@@ -2022,6 +1690,10 @@ $history_count = $history_result->num_rows;
 
 </div>
 
+<!-- =====================================================
+     SUBSCRIPTION APPROVAL HISTORY MODAL
+===================================================== -->
+
 <div
     class="subs-modal"
     id="subsHistoryModal"
@@ -2041,7 +1713,7 @@ $history_count = $history_result->num_rows;
                 </h3>
 
                 <p class="subs-modal-caption">
-                    Administrator payment confirmation records
+                    Records of approved and rejected subscription notices.
                 </p>
             </div>
 
@@ -2054,24 +1726,21 @@ $history_count = $history_result->num_rows;
         <div class="subs-modal-body">
 
             <div class="subs-history-intro">
-
                 <i class="fas fa-shield-halved"></i>
 
                 <div>
-                    <strong>Approval Records</strong>
-
+                    <strong>Subscription Action Records</strong>
                     <div>
-                        This section displays the administrators who successfully confirmed subscription payments.
+                        This section records administrators who approved or rejected subscription notices.
                     </div>
                 </div>
-
             </div>
 
             <div class="subs-table-top">
 
                 <div class="subs-table-title">
                     <i class="fas fa-list-check"></i>
-                    Approval Logs
+                    Approval and Rejection Logs
                 </div>
 
                 <div class="subs-count">
@@ -2087,15 +1756,14 @@ $history_count = $history_result->num_rows;
                     <table class="subs-table">
 
                         <thead>
-
                             <tr>
                                 <th>History ID</th>
                                 <th>Subscription ID</th>
-                                <th>Approved By</th>
-                                <th>Approval Date</th>
-                                <th>Approval Time</th>
+                                <th>Action</th>
+                                <th>Processed By</th>
+                                <th>Date</th>
+                                <th>Time</th>
                             </tr>
-
                         </thead>
 
                         <tbody>
@@ -2114,6 +1782,26 @@ $history_count = $history_result->num_rows;
 
                                         <td class="subs-strong">
                                             #<?= (int)$history['subscription_id'] ?>
+                                        </td>
+
+                                        <td>
+
+                                            <?php if ($history['action_status'] === 'Approved'): ?>
+
+                                                <span class="subs-badge green">
+                                                    <i class="fas fa-circle-check"></i>
+                                                    Approved
+                                                </span>
+
+                                            <?php else: ?>
+
+                                                <span class="subs-badge red">
+                                                    <i class="fas fa-circle-xmark"></i>
+                                                    Rejected
+                                                </span>
+
+                                            <?php endif; ?>
+
                                         </td>
 
                                         <td>
@@ -2155,16 +1843,12 @@ $history_count = $history_result->num_rows;
                             <?php else: ?>
 
                                 <tr>
-                                    <td colspan="5">
+                                    <td colspan="6">
 
                                         <div class="subs-empty">
-
                                             <i class="fas fa-inbox"></i>
-
                                             <h4>No Approval History Yet</h4>
-
-                                            <p>Confirmed subscription payments will appear here.</p>
-
+                                            <p>Approved and rejected subscription notices will appear here.</p>
                                         </div>
 
                                     </td>
@@ -2183,12 +1867,10 @@ $history_count = $history_result->num_rows;
         </div>
 
         <div class="subs-modal-foot">
-
             <button type="button" class="subs-btn neutral" data-subs-close>
                 <i class="fas fa-xmark"></i>
                 Close
             </button>
-
         </div>
 
     </div>
@@ -2208,17 +1890,6 @@ $history_count = $history_result->num_rows;
         });
     }
 
-    // DISMISS ALERTS
-    document.querySelectorAll('[data-subs-dismiss]').forEach(function (button) {
-        button.addEventListener('click', function () {
-            const alertBox = button.closest('.subs-alert');
-
-            if (alertBox) {
-                alertBox.remove();
-            }
-        });
-    });
-
     // APPROVAL HISTORY MODAL
     function openModal(modal) {
         modal.classList.add('open');
@@ -2232,7 +1903,9 @@ $history_count = $history_result->num_rows;
 
     document.querySelectorAll('[data-subs-open]').forEach(function (button) {
         button.addEventListener('click', function () {
-            const modal = document.getElementById(button.getAttribute('data-subs-open'));
+            const modal = document.getElementById(
+                button.getAttribute('data-subs-open')
+            );
 
             if (modal) {
                 openModal(modal);
