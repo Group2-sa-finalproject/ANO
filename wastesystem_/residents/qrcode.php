@@ -26,9 +26,14 @@ $conn->set_charset("utf8mb4");
 // Get resident information
 $sql = mysqli_prepare(
     $conn,
-    "SELECT id, fullname
-     FROM users
-     WHERE id = ? AND role = 'residents'
+    "SELECT
+        u.id,
+        u.fullname,
+        h.house_address
+     FROM users u
+     LEFT JOIN households h ON h.user_id = u.id
+     WHERE u.id = ?
+       AND u.role = 'residents'
      LIMIT 1"
 );
 
@@ -946,11 +951,15 @@ $qr_url = "https://api.qrserver.com/v1/create-qr-code/?size=400x400&data="
 
                             <div>
                                 <span class="detail-label">
-                                    Resident ID
+                                    Registered Address
                                 </span>
 
                                 <span class="detail-value">
-                                    <?php echo htmlspecialchars((string) $user["id"]); ?>
+                                    <?php
+                                    echo !empty($user["house_address"])
+                                        ? htmlspecialchars($user["house_address"], ENT_QUOTES, 'UTF-8')
+                                        : 'No registered address found';
+                                    ?>
                                 </span>
                             </div>
 
