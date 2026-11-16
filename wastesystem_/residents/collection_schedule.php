@@ -14,6 +14,35 @@ if (
 
 $user_id = (int) $_SESSION["user_id"];
 
+// Check if the resident has an active and fully paid subscription.
+$is_subscribed = false;
+
+$subscription_stmt = mysqli_prepare(
+    $conn,
+    "SELECT id
+     FROM subscriptions
+     WHERE user_id = ?
+       AND subscription_status = 'Active'
+       AND payment_status = 'Paid'
+     LIMIT 1"
+);
+
+if (!$subscription_stmt) {
+    die("Subscription check failed: " . mysqli_error($conn));
+}
+
+mysqli_stmt_bind_param($subscription_stmt, "i", $user_id);
+mysqli_stmt_execute($subscription_stmt);
+
+$subscription_result = mysqli_stmt_get_result($subscription_stmt);
+
+if (mysqli_num_rows($subscription_result) > 0) {
+    $is_subscribed = true;
+}
+
+mysqli_stmt_close($subscription_stmt);
+
+
 // CSRF protection for collection request cancellation
 if (empty($_SESSION["schedule_csrf"])) {
     $_SESSION["schedule_csrf"] = bin2hex(random_bytes(32));
@@ -116,114 +145,136 @@ $last_day->modify("last day of this month");
 
 $today = date("Y-m-d");
 
+
 // Schedule a collection
-if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST["schedule"])) {
+if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["schedule"])) {
+
+    $submitted_csrf = $_POST["csrf_token"] ?? "";
 
     $collection_date = $_POST["collection_date"] ?? "";
     $collection_address = trim($_POST["collection_address"] ?? "");
     $requested_time = trim($_POST["requested_time"] ?? "");
     $notes = trim($_POST["notes"] ?? "");
 
-    $valid_date = DateTime::createFromFormat("!Y-m-d", $collection_date);
-
+    // Validate CSRF token
     if (
-        !$valid_date ||
-        $valid_date->format("Y-m-d") !== $collection_date
+        !is_string($submitted_csrf) ||
+        !hash_equals($_SESSION["schedule_csrf"], $submitted_csrf)
     ) {
-        $message = "Please select a valid collection date.";
+        $message = "Invalid request. Please refresh the page and try again.";
         $message_type = "error";
 
-    } elseif ($collection_date < $today) {
+    // Verify subscription before allowing a collection request
+    } elseif (!$is_subscribed) {
 
-        $message = "You cannot schedule a collection on a past date.";
-        $message_type = "error";
-
-    } elseif ($collection_address == "") {
-
-        $message = "Please enter your collection address.";
-        $message_type = "error";
-
-    } elseif (strlen($collection_address) > 255) {
-
-        $message = "The address must not exceed 255 characters.";
-        $message_type = "error";
-
-    } elseif (empty($requested_time)) {
-
-        $message = "Please select your preferred collection time.";
+        $message = "You need an active and fully paid subscription before requesting a collection.";
         $message_type = "error";
 
     } else {
 
-        // Check if the selected date is already booked
-        $check = mysqli_prepare(
-            $conn,
-            "SELECT id
-             FROM collection_schedules
-             WHERE collection_date = ?
-             AND status IN ('Pending', 'Approved')
-             LIMIT 1"
-        );
+        $valid_date = DateTime::createFromFormat("!Y-m-d", $collection_date);
 
-        if (!$check) {
-            die("Database error: " . mysqli_error($conn));
-        }
+        if (
+            !$valid_date ||
+            $valid_date->format("Y-m-d") !== $collection_date
+        ) {
+            $message = "Please select a valid collection date.";
+            $message_type = "error";
 
-        mysqli_stmt_bind_param($check, "s", $collection_date);
-        mysqli_stmt_execute($check);
-        $result = mysqli_stmt_get_result($check);
+        } elseif ($collection_date < $today) {
 
-        if (mysqli_num_rows($result) > 0) {
+            $message = "You cannot schedule a collection on a past date.";
+            $message_type = "error";
 
-            $message = "Sorry! This date is already booked. Please choose another date.";
+        } elseif ($collection_address === "") {
+
+            $message = "Please enter your collection address.";
+            $message_type = "error";
+
+        } elseif (strlen($collection_address) > 255) {
+
+            $message = "The address must not exceed 255 characters.";
+            $message_type = "error";
+
+        } elseif (empty($requested_time)) {
+
+            $message = "Please select your preferred collection time.";
             $message_type = "error";
 
         } else {
 
-            // Save the schedule
-            $insert = mysqli_prepare(
+            // Check if the selected date is already booked
+            $check = mysqli_prepare(
                 $conn,
-                "INSERT INTO collection_schedules
-                (user_id, collection_date, requested_time, collection_address, notes)
-                VALUES (?, ?, ?, ?, ?)"
+                "SELECT id
+                 FROM collection_schedules
+                 WHERE collection_date = ?
+                   AND status IN ('Pending', 'Approved')
+                 LIMIT 1"
             );
 
-            if (!$insert) {
+            if (!$check) {
                 die("Database error: " . mysqli_error($conn));
             }
 
-            mysqli_stmt_bind_param(
-                $insert,
-                "issss",
-                $user_id,
-                $collection_date,
-                $requested_time,
-                $collection_address,
-                $notes
-            );
+            mysqli_stmt_bind_param($check, "s", $collection_date);
+            mysqli_stmt_execute($check);
 
-            if (mysqli_stmt_execute($insert)) {
+            $result = mysqli_stmt_get_result($check);
 
-                $message = "Collection scheduled successfully! Your request is Pending approval.";
-                $message_type = "success";
+            if (mysqli_num_rows($result) > 0) {
+
+                $message = "Sorry! This date is already booked. Please choose another date.";
+                $message_type = "error";
 
             } else {
 
-                if (mysqli_errno($conn) == 1062) {
-                    $message = "Sorry! Another resident has already booked this date. Please choose another date.";
-                } else {
-                    $message = "Unable to save your schedule. Please try again.";
+                // Save the collection request
+                $insert = mysqli_prepare(
+                    $conn,
+                    "INSERT INTO collection_schedules
+                    (user_id, collection_date, requested_time, collection_address, notes)
+                    VALUES (?, ?, ?, ?, ?)"
+                );
+
+                if (!$insert) {
+                    die("Database error: " . mysqli_error($conn));
                 }
 
-                $message_type = "error";
+                mysqli_stmt_bind_param(
+                    $insert,
+                    "issss",
+                    $user_id,
+                    $collection_date,
+                    $requested_time,
+                    $collection_address,
+                    $notes
+                );
+
+                if (mysqli_stmt_execute($insert)) {
+
+                    $message = "Collection scheduled successfully! Your request is Pending approval.";
+                    $message_type = "success";
+
+                } else {
+
+                    if (mysqli_errno($conn) == 1062) {
+                        $message = "Sorry! Another resident has already booked this date. Please choose another date.";
+                    } else {
+                        $message = "Unable to save your schedule. Please try again.";
+                    }
+
+                    $message_type = "error";
+                }
+
+                mysqli_stmt_close($insert);
             }
 
-            mysqli_stmt_close($insert);
+            mysqli_stmt_close($check);
         }
-
-        mysqli_stmt_close($check);
     }
 }
+
 
 // Get booked dates in selected month
 $booked_dates = [];
@@ -1057,7 +1108,8 @@ a {
                                 Already booked
                             </span>
 
-                        <?php else: ?>
+                       
+                        <?php elseif ($is_subscribed): ?>
 
                             <button
                                 type="button"
@@ -1066,7 +1118,14 @@ a {
                                 Select date
                             </button>
 
+                        <?php else: ?>
+
+                            <span class="booked-label">
+                                Subscription required
+                            </span>
+
                         <?php endif; ?>
+
 
                     </div>
 
@@ -1092,72 +1151,107 @@ a {
 
             <h3>Submit Collection Request</h3>
 
-            <p>
-                Complete the form below to request a garbage collection.
-            </p>
+            <?php if ($is_subscribed): ?>
 
-            <form method="POST" action="" id="schedule-form">
+                <p>
+                    Complete the form below to request a garbage collection.
+                </p>
 
-                <div class="form-group">
-                    <label for="collection_date">Collection Date</label>
-
-                    <input
-                        type="date"
-                        id="collection_date"
-                        name="collection_date"
-                        min="<?= h($today) ?>"
-                        value="<?= h($_POST['collection_date'] ?? '') ?>"
-                        required
-                    >
-                </div>
-
-                <div class="form-group">
-                    <label for="requested_time">Requested Time</label>
+                <form method="POST" action="" id="schedule-form">
 
                     <input
-                        type="time"
-                        id="requested_time"
-                        name="requested_time"
-                        value="<?= h($_POST['requested_time'] ?? '') ?>"
-                        required
+                        type="hidden"
+                        name="csrf_token"
+                        value="<?= h($_SESSION["schedule_csrf"]) ?>"
                     >
+
+                    <div class="form-group">
+                        <label for="collection_date">Collection Date</label>
+
+                        <input
+                            type="date"
+                            id="collection_date"
+                            name="collection_date"
+                            min="<?= h($today) ?>"
+                            value="<?= h($_POST['collection_date'] ?? '') ?>"
+                            required
+                        >
+                    </div>
+
+                    <div class="form-group">
+                        <label for="requested_time">Requested Time</label>
+
+                        <input
+                            type="time"
+                            id="requested_time"
+                            name="requested_time"
+                            value="<?= h($_POST['requested_time'] ?? '') ?>"
+                            required
+                        >
+                    </div>
+
+                    <div class="form-group">
+                        <label for="collection_address">Collection Address</label>
+
+                        <input
+                            type="text"
+                            id="collection_address"
+                            name="collection_address"
+                            maxlength="255"
+                            value="<?= h($_POST['collection_address'] ?? '') ?>"
+                            placeholder="Enter your complete collection address"
+                            required
+                        >
+                    </div>
+
+                    <div class="form-group">
+                        <label for="notes">Additional Notes (Optional)</label>
+
+                        <textarea
+                            id="notes"
+                            name="notes"
+                            placeholder="Example: Garbage is placed outside the gate."
+                        ><?= h($_POST['notes'] ?? '') ?></textarea>
+                    </div>
+
+                    <button
+                        type="submit"
+                        name="schedule"
+                        value="1"
+                        class="submit-button">
+
+                        <i class="fas fa-calendar-check me-1"></i>
+                        Submit Collection Request
+
+                    </button>
+
+                </form>
+
+            <?php else: ?>
+
+                <div class="warning-box">
+
+                    <h5 style="font-size:15px; font-weight:700;">
+                        <i class="fas fa-lock me-2"></i>
+                        Subscription Required
+                    </h5>
+
+                    <p style="margin-bottom:12px;">
+                        You must have an active and fully paid subscription
+                        before you can request a special garbage collection.
+                    </p>
+
+                    <a href="subscription.php" class="btn btn-ecotrack">
+                        <i class="fas fa-file-invoice-dollar me-1"></i>
+                        View Subscription
+                    </a>
+
                 </div>
 
-                <div class="form-group">
-                    <label for="collection_address">Collection Address</label>
-
-                    <input
-                        type="text"
-                        id="collection_address"
-                        name="collection_address"
-                        maxlength="255"
-                        value="<?= h($_POST['collection_address'] ?? '') ?>"
-                        placeholder="Enter your complete collection address"
-                        required
-                    >
-                </div>
-
-                <div class="form-group">
-                    <label for="notes">Additional Notes (Optional)</label>
-
-                    <textarea
-                        id="notes"
-                        name="notes"
-                        placeholder="Example: Garbage is placed outside the gate."
-                    ><?= h($_POST['notes'] ?? '') ?></textarea>
-                </div>
-
-                <button
-                    type="submit"
-                    name="schedule"
-                    class="submit-button">
-                    <i class="fas fa-calendar-check me-1"></i>
-                    Submit Collection Request
-                </button>
-
-            </form>
+            <?php endif; ?>
 
         </div>
+
 
         <!-- COLLECTION HISTORY -->
         <div class="schedule-card">
