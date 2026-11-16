@@ -1,12 +1,12 @@
+
 <?php
 session_start();
 require_once "../config/database.php";
 
-// Only logged-in collectors can access this page.
+// COLLECTOR ACCESS CHECK
 if (
     !isset($_SESSION["user_id"]) ||
-    !isset($_SESSION["role"]) ||
-    $_SESSION["role"] !== "collector"
+    ($_SESSION["role"] ?? "") !== "collector"
 ) {
     header("Location: ../index.php");
     exit;
@@ -14,8 +14,58 @@ if (
 
 $collector_id = (int) $_SESSION["user_id"];
 
-// Get approved requests assigned to this collector.
-$stmt = $conn->prepare(" 
+if (empty($_SESSION["csrf_token"])) {
+    $_SESSION["csrf_token"] = bin2hex(random_bytes(32));
+}
+
+$message = "";
+$message_type = "";
+
+// MARK REQUEST AS COMPLETED
+if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["mark_collected"])) {
+
+    $schedule_id = (int) ($_POST["schedule_id"] ?? 0);
+    $submitted_token = $_POST["csrf_token"] ?? "";
+
+    if (
+        $schedule_id <= 0 ||
+        !hash_equals($_SESSION["csrf_token"], $submitted_token)
+    ) {
+        $message = "Invalid request. Please refresh the page and try again.";
+        $message_type = "danger";
+
+    } else {
+
+        // Only the collector assigned to this request can complete it.
+        $update_stmt = $conn->prepare("
+            UPDATE collection_schedules
+            SET status = 'Completed'
+            WHERE id = ?
+              AND collector_id = ?
+              AND status = 'Approved'
+        ");
+
+        if (!$update_stmt) {
+            die("Unable to prepare collection update: " . htmlspecialchars($conn->error));
+        }
+
+        $update_stmt->bind_param("ii", $schedule_id, $collector_id);
+
+        if ($update_stmt->execute() && $update_stmt->affected_rows > 0) {
+            $message = "Collection successfully marked as completed.";
+            $message_type = "success";
+        } else {
+            $message = "This request could not be completed. It may already be completed or may not be assigned to your account.";
+            $message_type = "danger";
+        }
+
+        $update_stmt->close();
+    }
+}
+
+// GET ONLY APPROVED REQUESTS ASSIGNED TO THIS COLLECTOR
+// Completed requests automatically disappear after the page reloads.
+$stmt = $conn->prepare("
     SELECT
         cs.id AS schedule_id,
         cs.collection_date,
@@ -39,18 +89,22 @@ $stmt = $conn->prepare("
 ");
 
 if (!$stmt) {
-    die("Database query failed: " . htmlspecialchars($conn->error, ENT_QUOTES, 'UTF-8'));
+    die("Database query failed: " . htmlspecialchars($conn->error));
 }
 
 $stmt->bind_param("i", $collector_id);
 $stmt->execute();
+
 $result = $stmt->get_result();
 $requests = [];
+
 while ($row = $result->fetch_assoc()) {
     $requests[] = $row;
 }
+
 $stmt->close();
 ?>
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -223,6 +277,19 @@ $stmt->close();
     <h2 class="page-title">My Collection Route</h2>
     <p class="page-subtitle">View approved collection requests assigned to your account.</p>
 
+    <?php if ($message !== ""): ?>
+        <div style="
+            padding: 12px 15px;
+            margin-bottom: 18px;
+            border-radius: 8px;
+            background: <?= $message_type === "success" ? "#d4edda" : "#f8d7da"; ?>;
+            color: <?= $message_type === "success" ? "#155724" : "#721c24"; ?>;
+            border: 1px solid <?= $message_type === "success" ? "#c3e6cb" : "#f5c6cb"; ?>;
+        ">
+            <?= htmlspecialchars($message, ENT_QUOTES, "UTF-8"); ?>
+        </div>
+    <?php endif; ?>
+
     <!-- ASSIGNED COLLECTION REQUESTS -->
     <div class="route-card">
         <div class="card-head">
@@ -269,6 +336,28 @@ $stmt->close();
                                 <i class="bi bi-sign-turn-right"></i> Get Directions
                             </button>
                         </div>
+
+                        <form method="POST"
+                            onsubmit="return confirm('Are you sure this special pickup has been collected?');"
+                            style="margin-top: 10px;">
+
+                            <input type="hidden" name="schedule_id"
+                                value="<?= (int) $request["schedule_id"]; ?>">
+
+                            <input type="hidden" name="csrf_token"
+                                value="<?= htmlspecialchars($_SESSION["csrf_token"], ENT_QUOTES, "UTF-8"); ?>">
+
+                            <button type="submit"
+                                    name="mark_collected"
+                                    value="1"
+                                    class="btn-green"
+                                    style="width: 100%; background: #157347;">
+
+                                <i class="bi bi-check-circle-fill"></i>
+                                Mark as Collected
+
+                            </button>
+                        </form>
                     </div>
                 <?php endforeach; ?>
             </div>
